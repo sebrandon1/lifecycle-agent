@@ -1,6 +1,7 @@
 package initmonitor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -26,12 +27,18 @@ type InitMonitor struct {
 	rpmOstreeClient      *rpmostreeclient.Client
 	ostreeClient         ostreeclient.IClient
 	rebootClient         reboot.RebootIntf
+	mode                 string
 }
 
-func NewInitMonitor(scheme *runtime.Scheme, log *logrus.Logger, hostCommandsExecutor ops.Execute, ops ops.Ops, component string) *InitMonitor {
+func NewInitMonitor(scheme *runtime.Scheme, log *logrus.Logger, hostCommandsExecutor ops.Execute, ops ops.Ops, component, mode string) *InitMonitor {
 	rpmOstreeClient := rpmostreeclient.NewClient("initmonitor", hostCommandsExecutor)
 	ostreeClient := ostreeclient.NewClient(hostCommandsExecutor, false)
-	rebootClient := reboot.NewRebootClient(&logr.Logger{}, hostCommandsExecutor, rpmOstreeClient, ostreeClient, ops)
+	var rebootClient reboot.RebootIntf
+	if mode == "ipconfig" {
+		rebootClient = reboot.NewIPCRebootClient(&logr.Logger{}, hostCommandsExecutor, rpmOstreeClient, ostreeClient, ops)
+	} else {
+		rebootClient = reboot.NewIBURebootClient(&logr.Logger{}, hostCommandsExecutor, rpmOstreeClient, ostreeClient, ops)
+	}
 	return &InitMonitor{
 		scheme:               scheme,
 		log:                  log,
@@ -41,11 +48,12 @@ func NewInitMonitor(scheme *runtime.Scheme, log *logrus.Logger, hostCommandsExec
 		rpmOstreeClient:      rpmOstreeClient,
 		ostreeClient:         ostreeClient,
 		rebootClient:         rebootClient,
+		mode:                 mode,
 	}
 }
 
-func (m *InitMonitor) RunInitMonitor() error {
-	rollbackCfg, err := m.rebootClient.ReadIBUAutoRollbackConfigFile()
+func (m *InitMonitor) RunInitMonitor(ctx context.Context) error {
+	rollbackCfg, err := m.rebootClient.ReadAutoRollbackConfigFile()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -67,16 +75,21 @@ func (m *InitMonitor) RunInitMonitor() error {
 
 	timeout := time.Duration(rollbackCfg.InitMonitorTimeout) * time.Second
 
-	m.log.Infof("Launching LCA Init Monitor timeout. Automatic rollback will occur in %s if upgrade is not completed successfully within that time", timeout)
+	// Adjust log message based on mode
+	contextText := "upgrade"
+	if m.mode == "ipconfig" {
+		contextText = "ip-config"
+	}
+	m.log.Infof("Launching LCA Init Monitor timeout. Automatic rollback will occur in %s if %s is not completed successfully within that time", timeout, contextText)
 
 	time.Sleep(timeout)
 
-	// If we reach this point, the init monitor was not shut down by the Upgrade handler, so trigger rollback
+	// If we reach this point, the init monitor was not shut down by the handler, so trigger rollback
 
 	msg := fmt.Sprintf("Rollback due to LCA Init Monitor timeout, after %s", timeout)
 	m.log.Info(msg)
 
-	if err := m.rebootClient.InitiateRollback(msg); err != nil {
+	if err := m.rebootClient.InitiateRollback(ctx, msg); err != nil {
 		return fmt.Errorf("unable to auto rollback: %w", err)
 	}
 
@@ -84,7 +97,7 @@ func (m *InitMonitor) RunInitMonitor() error {
 }
 
 func (m *InitMonitor) checkSvcUnitRollbackNeeded() bool {
-	rollbackCfg, err := m.rebootClient.ReadIBUAutoRollbackConfigFile()
+	rollbackCfg, err := m.rebootClient.ReadAutoRollbackConfigFile()
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false
@@ -117,12 +130,12 @@ func (m *InitMonitor) checkSvcUnitRollbackNeeded() bool {
 	return true
 }
 
-func (m *InitMonitor) RunExitStopPostCheck() error {
+func (m *InitMonitor) RunExitStopPostCheck(ctx context.Context) error {
 	if m.checkSvcUnitRollbackNeeded() {
 		msg := fmt.Sprintf("Rollback due to service-unit failure: component %s", m.component)
 		m.log.Info(msg)
 
-		if err := m.rebootClient.InitiateRollback(msg); err != nil {
+		if err := m.rebootClient.InitiateRollback(ctx, msg); err != nil {
 			return fmt.Errorf("unable to auto rollback: %w", err)
 		}
 	}

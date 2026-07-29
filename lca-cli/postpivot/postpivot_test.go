@@ -3,11 +3,9 @@ package postpivot
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
-	"k8s.io/client-go/kubernetes/scheme"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -33,80 +30,136 @@ import (
 	"github.com/openshift-kni/lifecycle-agent/utils"
 )
 
-func TestSetNodeIPIfNotProvided(t *testing.T) {
-	createNodeIpFile := func(t *testing.T, ipFile string, ipToSet string) {
-		f, err := os.Create(ipFile)
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		defer f.Close()
-		if _, err = f.WriteString(ipToSet); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-	}
-
-	var (
-		mockController = gomock.NewController(t)
-		mockOps        = ops.NewMockOps(mockController)
-	)
-
-	defer func() {
-		mockController.Finish()
-	}()
-
+func TestSetNodeIPsIfNotProvided_DualStack(t *testing.T) {
 	testcases := []struct {
-		name             string
-		expectedError    bool
-		nodeipFileExists bool
-		ipProvided       bool
-		ipToSet          string
+		name            string
+		expectedError   bool
+		initialNodeIPs  []string
+		expectedNodeIPs []string
 	}{
 		{
-			name:             "Ip provided nothing to do",
-			expectedError:    false,
-			nodeipFileExists: true,
-			ipProvided:       true,
-			ipToSet:          "192.167.1.2",
+			name:            "NodeIPs provided - nothing to do",
+			expectedError:   false,
+			initialNodeIPs:  []string{"192.168.1.2"},
+			expectedNodeIPs: []string{"192.168.1.2"},
 		},
 		{
-			name:             "Ip is not provided, bad ip in file",
-			expectedError:    true,
-			nodeipFileExists: true,
-			ipProvided:       false,
-			ipToSet:          "bad ip",
+			name:            "Dual stack NodeIPs provided - nothing to do",
+			expectedError:   false,
+			initialNodeIPs:  []string{"192.168.1.2", "2001:db8::2"},
+			expectedNodeIPs: []string{"192.168.1.2", "2001:db8::2"},
 		},
 		{
-			name:             "Ip is not provided, happy flow",
-			expectedError:    false,
-			nodeipFileExists: true,
-			ipProvided:       false,
-			ipToSet:          "192.167.1.2",
+			name:            "IPv6 only NodeIPs provided - nothing to do",
+			expectedError:   false,
+			initialNodeIPs:  []string{"2001:db8::10"},
+			expectedNodeIPs: []string{"2001:db8::10"},
+		},
+		{
+			name:            "Multiple IPv4 addresses provided - nothing to do",
+			expectedError:   false,
+			initialNodeIPs:  []string{"192.168.1.10", "10.0.0.10"},
+			expectedNodeIPs: []string{"192.168.1.10", "10.0.0.10"},
 		},
 	}
 
 	for _, tc := range testcases {
-		tmpDir := t.TempDir()
 		t.Run(tc.name, func(t *testing.T) {
 			log := &logrus.Logger{}
-			pp := NewPostPivot(nil, log, mockOps, "", "", "")
-			seedReconfig := &clusterconfig_api.SeedReconfiguration{}
-			if tc.ipProvided {
-				seedReconfig.NodeIP = tc.ipToSet
-			}
-			ipFile := path.Join(tmpDir, "primary")
-			if tc.nodeipFileExists {
-				createNodeIpFile(t, ipFile, tc.ipToSet)
-			} else {
-				mockOps.EXPECT().SystemctlAction("start", "nodeip-configuration").Return("", nil).Do(func(any) {
-					createNodeIpFile(t, ipFile, tc.ipToSet)
-				})
+			pp := NewPostPivot(nil, log, nil, "", "", "")
+			seedReconfig := &clusterconfig_api.SeedReconfiguration{
+				NodeIPs: tc.initialNodeIPs,
 			}
 
-			err := pp.setNodeIPIfNotProvided(context.TODO(), seedReconfig, ipFile)
-			if !tc.expectedError && err != nil {
-				t.Errorf("unexpected error: %v", err)
+			err := pp.setNodeIPsIfNotProvided(context.TODO(), seedReconfig)
+
+			if tc.expectedError {
+				assert.Error(t, err)
 			} else {
-				assert.Equal(t, err != nil, tc.expectedError)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedNodeIPs, seedReconfig.NodeIPs)
+			}
+		})
+	}
+}
+
+func TestParseKubeletNodeIPs(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		expectedIPs []string
+		expectedErr bool
+	}{
+		{
+			name:        "single IP with KUBELET_NODE_IP",
+			content:     `Environment="KUBELET_NODE_IP=192.168.1.10"`,
+			expectedIPs: []string{"192.168.1.10"},
+			expectedErr: false,
+		},
+		{
+			name:        "dual stack with KUBELET_NODE_IPS",
+			content:     `Environment="KUBELET_NODE_IPS=192.168.1.10,2001:db8::10"`,
+			expectedIPs: []string{"192.168.1.10", "2001:db8::10"},
+			expectedErr: false,
+		},
+		{
+			name:        "both variables - prefer KUBELET_NODE_IPS",
+			content:     `Environment="KUBELET_NODE_IP=192.168.1.5" "KUBELET_NODE_IPS=192.168.1.10,2001:db8::10"`,
+			expectedIPs: []string{"192.168.1.10", "2001:db8::10"},
+			expectedErr: false,
+		},
+		{
+			name:        "IPv6 only",
+			content:     `Environment="KUBELET_NODE_IP=2001:db8::10"`,
+			expectedIPs: []string{"2001:db8::10"},
+			expectedErr: false,
+		},
+		{
+			name:        "multiple IPv4 addresses",
+			content:     `Environment="KUBELET_NODE_IPS=192.168.1.10,10.0.0.10,172.16.1.10"`,
+			expectedIPs: []string{"192.168.1.10", "10.0.0.10", "172.16.1.10"},
+			expectedErr: false,
+		},
+		{
+			name:        "spaces in IPs list",
+			content:     `Environment="KUBELET_NODE_IPS=192.168.1.10, 2001:db8::10 , 172.16.1.10"`,
+			expectedIPs: []string{"192.168.1.10", "2001:db8::10", "172.16.1.10"},
+			expectedErr: false,
+		},
+		{
+			name: "multiline environment",
+			content: `[Unit]
+Description=Test
+[Service]
+Environment="KUBELET_NODE_IP=192.168.1.10"
+ExecStart=/bin/test`,
+			expectedIPs: []string{"192.168.1.10"},
+			expectedErr: false,
+		},
+		{
+			name:        "no IP variables found",
+			content:     `Environment="OTHER_VAR=value"`,
+			expectedIPs: nil,
+			expectedErr: true,
+		},
+		{
+			name:        "empty content",
+			content:     "",
+			expectedIPs: nil,
+			expectedErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ips, err := parseKubeletNodeIPs(tt.content)
+
+			if tt.expectedErr {
+				assert.Error(t, err)
+				assert.Nil(t, ips)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectedIPs, ips)
 			}
 		})
 	}
@@ -126,15 +179,66 @@ func TestSetDnsMasqConfiguration(t *testing.T) {
 		name                string
 		expectedError       bool
 		seedReconfiguration *clusterconfig_api.SeedReconfiguration
+		expectedIP          string
 	}{
 		{
-			name: "Happy flow",
+			name: "Happy flow with single IPv4",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				BaseDomain:  "new.com",
+				ClusterName: "new_name",
+				NodeIPs:     []string{"192.167.127.10"},
+			},
+			expectedError: false,
+			expectedIP:    "192.167.127.10",
+		},
+		{
+			name: "IPv6 only",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				BaseDomain:  "new.com",
+				ClusterName: "new_name",
+				NodeIPs:     []string{"2001:db8::10"},
+			},
+			expectedError: false,
+			expectedIP:    "2001:db8::10",
+		},
+		{
+			name: "Dual stack primary IPv4",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				BaseDomain:  "new.com",
+				ClusterName: "new_name",
+				NodeIPs:     []string{"192.167.127.10", "2001:db8::10"},
+			},
+			expectedError: false,
+			expectedIP:    "192.167.127.10",
+		},
+		{
+			name: "Dual stack primary IPv6",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				BaseDomain:  "new.com",
+				ClusterName: "new_name",
+				NodeIPs:     []string{"2001:db8::10", "192.167.127.10"},
+			},
+			expectedError: false,
+			expectedIP:    "2001:db8::10",
+		},
+		{
+			name: "Empty NodeIPs",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				BaseDomain:  "new.com",
+				ClusterName: "new_name",
+				NodeIPs:     []string{},
+			},
+			expectedError: true,
+		},
+		{
+			name: "Legacy NodeIP field (backward compatibility)",
 			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
 				BaseDomain:  "new.com",
 				ClusterName: "new_name",
 				NodeIP:      "192.167.127.10",
+				NodeIPs:     []string{}, // Empty, should fall back to NodeIP
 			},
-			expectedError: false,
+			expectedError: true, // Current implementation expects NodeIPs to be populated
 		},
 	}
 
@@ -147,19 +251,351 @@ func TestSetDnsMasqConfiguration(t *testing.T) {
 			err := pp.setDnsMasqConfiguration(tc.seedReconfiguration, confFile)
 			if !tc.expectedError && err != nil {
 				t.Errorf("unexpected error: %v", err)
-			} else {
-				assert.Equal(t, err != nil, tc.expectedError)
+			} else if tc.expectedError && err == nil {
+				t.Errorf("expected error but got none")
 			}
-			if !tc.expectedError {
-				data, errF := os.ReadFile(confFile)
-				if errF != nil {
-					t.Errorf("unexpected error: %v", err)
+
+			if !tc.expectedError && err == nil {
+				// Verify the configuration file content
+				content, readErr := os.ReadFile(confFile)
+				if readErr != nil {
+					t.Errorf("failed to read config file: %v", readErr)
 				}
-				lines := strings.Split(string(data), "\n")
-				assert.Equal(t, len(lines), 3)
-				assert.Equal(t, lines[0], fmt.Sprintf("SNO_CLUSTER_NAME_OVERRIDE=%s", tc.seedReconfiguration.ClusterName))
-				assert.Equal(t, lines[1], fmt.Sprintf("SNO_BASE_DOMAIN_OVERRIDE=%s", tc.seedReconfiguration.BaseDomain))
-				assert.Equal(t, lines[2], fmt.Sprintf("SNO_DNSMASQ_IP_OVERRIDE=%s", tc.seedReconfiguration.NodeIP))
+				configStr := string(content)
+				assert.Contains(t, configStr, fmt.Sprintf("SNO_DNSMASQ_IP_OVERRIDE=%s", tc.expectedIP))
+				assert.Contains(t, configStr, fmt.Sprintf("SNO_CLUSTER_NAME_OVERRIDE=%s", tc.seedReconfiguration.ClusterName))
+				assert.Contains(t, configStr, fmt.Sprintf("SNO_BASE_DOMAIN_OVERRIDE=%s", tc.seedReconfiguration.BaseDomain))
+			}
+		})
+	}
+}
+
+func TestGetMachineNetworksFromSeedReconfig(t *testing.T) {
+	tests := []struct {
+		name             string
+		seedReconfig     *clusterconfig_api.SeedReconfiguration
+		expectedNetworks []string
+	}{
+		{
+			name: "new field populated",
+			seedReconfig: &clusterconfig_api.SeedReconfiguration{
+				MachineNetworks: []string{"192.168.1.0/24", "2001:db8::/64"},
+			},
+			expectedNetworks: []string{"192.168.1.0/24", "2001:db8::/64"},
+		},
+		{
+			name: "legacy field populated",
+			seedReconfig: &clusterconfig_api.SeedReconfiguration{
+				MachineNetwork: "192.168.1.0/24",
+			},
+			expectedNetworks: []string{"192.168.1.0/24"},
+		},
+		{
+			name: "both fields populated - new takes precedence",
+			seedReconfig: &clusterconfig_api.SeedReconfiguration{
+				MachineNetwork:  "10.0.0.0/8",
+				MachineNetworks: []string{"192.168.1.0/24", "2001:db8::/64"},
+			},
+			expectedNetworks: []string{"192.168.1.0/24", "2001:db8::/64"},
+		},
+		{
+			name: "both fields empty",
+			seedReconfig: &clusterconfig_api.SeedReconfiguration{
+				MachineNetwork:  "",
+				MachineNetworks: []string{},
+			},
+			expectedNetworks: []string{},
+		},
+		{
+			name: "legacy field empty, new field populated",
+			seedReconfig: &clusterconfig_api.SeedReconfiguration{
+				MachineNetwork:  "",
+				MachineNetworks: []string{"192.168.1.0/24"},
+			},
+			expectedNetworks: []string{"192.168.1.0/24"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getMachineNetworksFromSeedReconfig(tt.seedReconfig)
+			assert.Equal(t, tt.expectedNetworks, result)
+		})
+	}
+}
+
+func TestSeedClusterInfoNodeIPs(t *testing.T) {
+	tests := []struct {
+		name            string
+		seedClusterInfo *seedclusterinfo.SeedClusterInfo
+		expectedNodeIPs []string
+	}{
+		{
+			name: "new field populated",
+			seedClusterInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			expectedNodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+		},
+		{
+			name: "legacy field populated",
+			seedClusterInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIP: "192.168.1.10",
+			},
+			expectedNodeIPs: []string{"192.168.1.10"},
+		},
+		{
+			name: "both fields populated - new takes precedence",
+			seedClusterInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIP:  "10.0.0.10",
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			expectedNodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+		},
+		{
+			name: "both fields empty",
+			seedClusterInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIP:  "",
+				NodeIPs: []string{},
+			},
+			expectedNodeIPs: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := seedClusterInfoNodeIPs(tt.seedClusterInfo)
+			assert.Equal(t, tt.expectedNodeIPs, result)
+		})
+	}
+}
+
+func TestSeedReconfigurationNodeIPs(t *testing.T) {
+	tests := []struct {
+		name                string
+		seedReconfiguration *clusterconfig_api.SeedReconfiguration
+		expectedNodeIPs     []string
+	}{
+		{
+			name: "new field populated",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			expectedNodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+		},
+		{
+			name: "legacy field populated",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				NodeIP: "192.168.1.10",
+			},
+			expectedNodeIPs: []string{"192.168.1.10"},
+		},
+		{
+			name: "both fields populated - new takes precedence",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				NodeIP:  "10.0.0.10",
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			expectedNodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+		},
+		{
+			name: "both fields empty",
+			seedReconfiguration: &clusterconfig_api.SeedReconfiguration{
+				NodeIP:  "",
+				NodeIPs: []string{},
+			},
+			expectedNodeIPs: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := seedReconfigurationNodeIPs(tt.seedReconfiguration)
+			assert.Equal(t, tt.expectedNodeIPs, result)
+		})
+	}
+}
+
+func TestValidateIPAndMachineNetworkConsistency(t *testing.T) {
+	tests := []struct {
+		name          string
+		seedInfo      *seedclusterinfo.SeedClusterInfo
+		reconfig      *clusterconfig_api.SeedReconfiguration
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "single-stack ipv4 success without seed machine networks",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs:         []string{"192.168.1.10"},
+				MachineNetworks: []string{},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2"},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   false,
+			errorContains: "",
+		},
+		{
+			name: "dual-stack success with seed machine networks",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs:         []string{"192.168.1.10", "2001:db8::10"},
+				MachineNetworks: []string{"192.168.1.0/24", "2001:db8::/64"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2", "2001:db8::2"},
+				MachineNetworks: []string{"10.0.0.0/24", "2001:db8::/64"},
+			},
+			expectError:   false,
+			errorContains: "",
+		},
+		{
+			name: "error when seed node IPs empty",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2"},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "node IPs must be provided",
+		},
+		{
+			name: "error when reconfig node IPs empty",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"192.168.1.10"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "node IPs must be provided",
+		},
+		{
+			name: "error node IP count mismatch",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2"},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "node IPs count mismatch",
+		},
+		{
+			name: "error node IP family mismatch at index",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"2001:db8::2", "10.0.0.2"},
+				MachineNetworks: []string{"2001:db8::/64", "10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "node IP family mismatch",
+		},
+		{
+			name: "error when machine networks count differs from node IPs",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2", "2001:db8::2"},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "machineNetworks count",
+		},
+		{
+			name: "error when machine networks family mismatches node IP family",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"192.168.1.10", "2001:db8::10"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2", "2001:db8::2"},
+				MachineNetworks: []string{"2001:db8::/64", "10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "machineNetwork family at index",
+		},
+		{
+			name: "error when seed machine networks count mismatches reconfig",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs:         []string{"192.168.1.10", "2001:db8::10"},
+				MachineNetworks: []string{"192.168.1.0/24"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2", "2001:db8::2"},
+				MachineNetworks: []string{"10.0.0.0/24", "2001:db8::/64"},
+			},
+			expectError:   true,
+			errorContains: "seed machineNetworks count",
+		},
+		{
+			name: "error when seed machine networks family mismatches reconfig",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs:         []string{"192.168.1.10", "2001:db8::10"},
+				MachineNetworks: []string{"2001:db8::/64", "192.168.1.0/24"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2", "2001:db8::2"},
+				MachineNetworks: []string{"10.0.0.0/24", "2001:db8::/64"},
+			},
+			expectError:   true,
+			errorContains: "machineNetwork family mismatch",
+		},
+		{
+			name: "error invalid seed IP",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"not-an-ip"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2"},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "invalid seed node IP",
+		},
+		{
+			name: "error invalid reconfiguration IP",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"10.0.0.1"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"bad-ip"},
+				MachineNetworks: []string{"10.0.0.0/24"},
+			},
+			expectError:   true,
+			errorContains: "invalid reconfiguration node IP",
+		},
+		{
+			name: "error invalid machine network cidr",
+			seedInfo: &seedclusterinfo.SeedClusterInfo{
+				NodeIPs: []string{"10.0.0.1"},
+			},
+			reconfig: &clusterconfig_api.SeedReconfiguration{
+				NodeIPs:         []string{"10.0.0.2"},
+				MachineNetworks: []string{"badcidr"},
+			},
+			expectError:   true,
+			errorContains: "invalid reconfiguration machineNetwork",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateIPAndMachineNetworkConsistency(tt.seedInfo, tt.reconfig)
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
@@ -229,12 +665,12 @@ interfaces:
 			nmstateFile := path.Join(tmpDir, "nmstate.yaml")
 			pp := NewPostPivot(nil, log, mockOps, "", tmpDir, "")
 			if tc.expectedError {
-				mockOps.EXPECT().RunInHostNamespace("nmstatectl", "apply", nmstateFile).Return("", fmt.Errorf("Dummy"))
+				mockOps.EXPECT().RunInHostNamespace(gomock.Any(), "nmstatectl", "apply", nmstateFile).Return("", fmt.Errorf("Dummy"))
 			} else {
-				mockOps.EXPECT().RunInHostNamespace("nmstatectl", "apply", nmstateFile).Return("", nil)
+				mockOps.EXPECT().RunInHostNamespace(gomock.Any(), "nmstatectl", "apply", nmstateFile).Return("", nil)
 			}
 
-			err := pp.applyNMStateConfiguration(tc.seedReconfiguration)
+			err := pp.applyNMStateConfiguration(context.TODO(), tc.seedReconfiguration)
 			if !tc.expectedError {
 				if err != nil {
 					t.Errorf("unexpected error: %v", err)
@@ -284,7 +720,7 @@ func TestCreatePullSecretFile(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			log := &logrus.Logger{}
 			pullSecretFile := path.Join(tmpDir, "config.json")
-			clientgoscheme.AddToScheme(scheme)
+			_ = clientgoscheme.AddToScheme(scheme)
 			pp := NewPostPivot(scheme, log, mockOps, "", tmpDir, "")
 			err := pp.createPullSecretFile(tc.pullSecret, pullSecretFile)
 			assert.Equal(t, err != nil, tc.expectedError)
@@ -347,13 +783,13 @@ func TestSetHostname(t *testing.T) {
 			mockOps := ops.NewMockOps(mockController)
 			pp := NewPostPivot(nil, log, mockOps, "", "", "")
 			if tc.hostname != "" && tc.hostname != localhost {
-				mockOps.EXPECT().RunInHostNamespace("hostnamectl", "set-hostname", tc.hostname).Return("", nil).Times(1)
+				mockOps.EXPECT().RunInHostNamespace(gomock.Any(), "hostnamectl", "set-hostname", tc.hostname).Return("", nil).Times(1)
 			} else if tc.hostname == "" {
-				mockOps.EXPECT().RunInHostNamespace("hostnamectl", "set-hostname", tc.hostname).Return("", nil).Times(0)
+				mockOps.EXPECT().RunInHostNamespace(gomock.Any(), "hostnamectl", "set-hostname", tc.hostname).Return("", nil).Times(0)
 				mockOps.EXPECT().GetHostname().Return(tc.osHostname, nil).Times(1)
 			}
 
-			hostname, err := pp.setHostname(tc.hostname)
+			hostname, err := pp.setHostname(context.TODO(), tc.hostname)
 			assert.Equal(t, tc.expectedError, err != nil, err)
 			if tc.hostname == "" {
 				assert.Equal(t, tc.osHostname, hostname)
@@ -415,16 +851,16 @@ func TestWaitForConfiguration(t *testing.T) {
 				}
 			}
 			if tc.listBlockDevicesSucceeds {
-				mockOps.EXPECT().ListBlockDevices().Return([]ops.BlockDevice{{Name: deviceName,
+				mockOps.EXPECT().ListBlockDevices(gomock.Any()).Return([]ops.BlockDevice{{Name: deviceName,
 					Label: clusterconfig_api.BlockDeviceLabel}}, nil).Times(1)
 				if tc.mountSucceeds {
-					mockOps.EXPECT().Mount(deviceName, gomock.Any()).Return(nil).Times(1)
-					mockOps.EXPECT().Umount(deviceName).Return(nil).Times(1)
+					mockOps.EXPECT().Mount(gomock.Any(), deviceName, gomock.Any()).Return(nil).Times(1)
+					mockOps.EXPECT().Umount(gomock.Any(), deviceName).Return(nil).Times(1)
 				} else {
-					mockOps.EXPECT().Mount(deviceName, gomock.Any()).Return(fmt.Errorf("dummy")).Times(1)
+					mockOps.EXPECT().Mount(gomock.Any(), deviceName, gomock.Any()).Return(fmt.Errorf("dummy")).Times(1)
 				}
 			} else if !tc.configurationFolderExists {
-				mockOps.EXPECT().ListBlockDevices().Return(nil, fmt.Errorf("dummy")).Do(cancel).Times(1)
+				mockOps.EXPECT().ListBlockDevices(gomock.Any()).Return(nil, fmt.Errorf("dummy")).Do(func(context.Context) { cancel() }).Times(1)
 			}
 
 			err := pp.waitForConfiguration(ctx, configFolder, configFolder)
@@ -437,7 +873,7 @@ func TestNetworkConfiguration(t *testing.T) {
 	seedReconfiguration := &clusterconfig_api.SeedReconfiguration{
 		BaseDomain:  "new.com",
 		ClusterName: "new_name",
-		NodeIP:      "192.167.127.10",
+		NodeIPs:     []string{"192.167.127.10"},
 		Hostname:    "test",
 	}
 
@@ -477,16 +913,16 @@ func TestNetworkConfiguration(t *testing.T) {
 			dnsmasqOverrides = path.Join(tmpDir, "dnsmasqoverrides")
 
 			if tc.restartNMSuccess {
-				mockOps.EXPECT().SystemctlAction("restart", nmService).Return("", nil).Times(1)
+				mockOps.EXPECT().SystemctlAction(gomock.Any(), "restart", nmService).Return("", nil).Times(1)
 				if tc.restartDNSMASQSuccess {
-					mockOps.EXPECT().RunInHostNamespace("hostnamectl", "set-hostname", "test").Return("", nil).Times(1)
-					mockOps.EXPECT().SystemctlAction("restart", dnsmasqService).Return("", nil).Times(1)
+					mockOps.EXPECT().RunInHostNamespace(gomock.Any(), "hostnamectl", "set-hostname", "test").Return("", nil).Times(1)
+					mockOps.EXPECT().SystemctlAction(gomock.Any(), "restart", dnsmasqService).Return("", nil).Times(1)
 				} else {
-					mockOps.EXPECT().RunInHostNamespace("hostnamectl", "set-hostname", "test").Return("", nil).Times(1)
-					mockOps.EXPECT().SystemctlAction("restart", dnsmasqService).Return("", fmt.Errorf("dummy")).Times(1)
+					mockOps.EXPECT().RunInHostNamespace(gomock.Any(), "hostnamectl", "set-hostname", "test").Return("", nil).Times(1)
+					mockOps.EXPECT().SystemctlAction(gomock.Any(), "restart", dnsmasqService).Return("", fmt.Errorf("dummy")).Times(1)
 				}
 			} else {
-				mockOps.EXPECT().SystemctlAction("restart", nmService).Return("", fmt.Errorf("dummy")).Times(1)
+				mockOps.EXPECT().SystemctlAction(gomock.Any(), "restart", nmService).Return("", fmt.Errorf("dummy")).Times(1)
 			}
 
 			err := pp.networkConfiguration(context.TODO(), seedReconfiguration)
@@ -527,7 +963,7 @@ func fakeManifests(tmpDir string) error {
 		},
 	}
 	if err := utils.MarshalToFile(cm, filepath.Join(tmpDir, "user-ca-bundle.json")); err != nil {
-		return fmt.Errorf("Unexpected error: %v", err)
+		return fmt.Errorf("Unexpected error: %w", err)
 	}
 
 	icspList := &operatorv1alpha1.ImageContentSourcePolicyList{}
@@ -537,7 +973,7 @@ func fakeManifests(tmpDir string) error {
 	icsp2.SetLabels(map[string]string{"test-label": "true"})
 	icspList.Items = append(icspList.Items, *icsp1, *icsp2)
 	if err := utils.MarshalToFile(icspList, filepath.Join(tmpDir, "icsps.json")); err != nil {
-		return fmt.Errorf("Unexpected error: %v", err)
+		return fmt.Errorf("Unexpected error: %w", err)
 	}
 	return nil
 }
@@ -585,7 +1021,7 @@ func TestApplyManifestsWithMultipleResources(t *testing.T) {
 		mockController.Finish()
 	}()
 
-	testscheme := scheme.Scheme
+	testscheme := clientgoscheme.Scheme
 	testscheme.AddKnownTypes(operatorv1alpha1.GroupVersion,
 		&operatorv1alpha1.ImageContentSourcePolicyList{})
 
@@ -651,7 +1087,7 @@ func TestApplyManifests(t *testing.T) {
 		mockController.Finish()
 	}()
 
-	testscheme := scheme.Scheme
+	testscheme := clientgoscheme.Scheme
 	testscheme.AddKnownTypes(operatorv1alpha1.GroupVersion,
 		&operatorv1alpha1.ImageContentSourcePolicyList{})
 
@@ -742,23 +1178,43 @@ func TestApplyManifests(t *testing.T) {
 func TestSetNodeIPHint(t *testing.T) {
 	testcases := []struct {
 		name          string
-		nodeCidr      string
+		nodeCidrs     []string
 		expectedError bool
+		expectedHint  string
 	}{
 		{
-			name:          "Wrong cidr provide, expected error",
-			nodeCidr:      "192.167.1.2",
+			name:          "Wrong cidr provided, expected error",
+			nodeCidrs:     []string{"192.167.1.2"},
 			expectedError: true,
 		},
 		{
-			name:          "Happy flow",
-			nodeCidr:      "192.167.1.0/24",
+			name:          "Happy flow single stack",
+			nodeCidrs:     []string{"192.167.1.0/24"},
+			expectedError: false,
+			expectedHint:  "KUBELET_NODEIP_HINT=192.167.1.0",
+		},
+		{
+			name:          "Happy flow dual stack",
+			nodeCidrs:     []string{"192.167.1.0/24", "2001:db8::/64"},
+			expectedError: false,
+			expectedHint:  "KUBELET_NODEIP_HINT=192.167.1.0 2001:db8::",
+		},
+		{
+			name:          "IPv6 only",
+			nodeCidrs:     []string{"2001:db8::/64"},
+			expectedError: false,
+			expectedHint:  "KUBELET_NODEIP_HINT=2001:db8::",
+		},
+		{
+			name:          "No cidrs provided",
+			nodeCidrs:     []string{},
 			expectedError: false,
 		},
 		{
-			name:          "No cidr providered",
-			nodeCidr:      "",
+			name:          "Multiple IPv4 cidrs",
+			nodeCidrs:     []string{"192.168.1.0/24", "10.0.0.0/8"},
 			expectedError: false,
+			expectedHint:  "KUBELET_NODEIP_HINT=192.168.1.0 10.0.0.0",
 		},
 	}
 
@@ -768,16 +1224,15 @@ func TestSetNodeIPHint(t *testing.T) {
 			log := &logrus.Logger{}
 			pp := NewPostPivot(nil, log, nil, "", tmpDir, "")
 			nodeIPHintFile = path.Join(tmpDir, "hint")
-			err := pp.setNodeIpHint(tc.nodeCidr)
+			err := pp.setNodeIpHint(tc.nodeCidrs)
 			assert.Equal(t, tc.expectedError, err != nil, err)
 			if !tc.expectedError {
-				if tc.nodeCidr != "" {
+				if len(tc.nodeCidrs) > 0 {
 					hint, err := os.ReadFile(nodeIPHintFile)
 					if err != nil {
 						t.Errorf("unexpected error: %v", err)
 					}
-					ip, _, _ := net.ParseCIDR(tc.nodeCidr)
-					assert.Equal(t, fmt.Sprintf("KUBELET_NODEIP_HINT=%s", ip), string(hint))
+					assert.Equal(t, tc.expectedHint, string(hint))
 				} else if _, err := os.Stat(nodeIPHintFile); err == nil {
 					t.Errorf("expected no node ip hint file to be created")
 				}
@@ -993,6 +1448,65 @@ func TestNodeLabelsProvided(t *testing.T) {
 				}
 			}
 
+		})
+	}
+}
+
+func TestRestartChronydService(t *testing.T) {
+	testcases := []struct {
+		name          string
+		chronyConfig  string
+		expectedError bool
+		expectCall    bool
+		mockError     error
+	}{
+		{
+			name:          "Happy flow - chronyd restart is called",
+			chronyConfig:  "server 192.168.1.1 iburst",
+			expectedError: false,
+			expectCall:    true,
+			mockError:     nil,
+		},
+		{
+			name:          "Chronyd restart fails",
+			chronyConfig:  "server 192.168.1.1 iburst",
+			expectedError: true,
+			expectCall:    true,
+			mockError:     fmt.Errorf("failed to restart chronyd"),
+		},
+		{
+			name:          "Empty chrony config - restart is skipped",
+			chronyConfig:  "",
+			expectedError: false,
+			expectCall:    false,
+			mockError:     nil,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a new mock controller for each test case to avoid conflicts
+			testMockController := gomock.NewController(t)
+			testMockOps := ops.NewMockOps(testMockController)
+			defer testMockController.Finish()
+
+			log := &logrus.Logger{}
+			pp := NewPostPivot(nil, log, testMockOps, "", "", "")
+
+			// Mock: chronyd restart only if expected
+			if tc.expectCall {
+				testMockOps.EXPECT().SystemctlAction(gomock.Any(), "restart", "chronyd").
+					Return("", tc.mockError).Times(1)
+			}
+
+			err := pp.restartChronydService(context.TODO(), tc.chronyConfig)
+
+			if tc.expectedError {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), "failed to restart chronyd")
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }

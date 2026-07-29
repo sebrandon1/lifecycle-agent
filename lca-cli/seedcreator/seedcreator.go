@@ -2,25 +2,18 @@ package seedcreator
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
-	ignconfig "github.com/coreos/ignition/v2/config"
-	mcv1 "github.com/openshift/api/machineconfiguration/v1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	cp "github.com/otiai10/copy"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	runtime "sigs.k8s.io/controller-runtime/pkg/client"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -72,9 +65,9 @@ func NewSeedCreator(client runtime.Client, log *logrus.Logger, ops ops.Ops, ostr
 // CreateSeedImage comprises the lca-cli workflow for creating a single OCI seed image
 func (s *SeedCreator) CreateSeedImage() error {
 	s.log.Info("Creating seed image")
-	ctx := context.TODO()
+	ctx := context.Background()
 
-	if err := s.copyConfigurationFiles(); err != nil {
+	if err := s.copyConfigurationFiles(ctx); err != nil {
 		return fmt.Errorf("failed to add configuration files: %w", err)
 	}
 
@@ -122,7 +115,7 @@ func (s *SeedCreator) CreateSeedImage() error {
 		s.log.Info("Seed cluster certificates backed up successfully for recert tool")
 	}
 
-	if err := s.stopServices(); err != nil {
+	if err := s.stopServices(ctx); err != nil {
 		return fmt.Errorf("failed to stop services to create seed image: %w", err)
 	}
 
@@ -130,7 +123,7 @@ func (s *SeedCreator) CreateSeedImage() error {
 		s.log.Info("Skipping recert validation.")
 	} else {
 		if err := utils.RunOnce("recert", common.BackupChecksDir, s.log, s.ops.ForceExpireSeedCrypto,
-			s.recertContainerImage, s.authFile, seedHasKubeadminPassword); err != nil {
+			ctx, s.recertContainerImage, s.authFile, seedHasKubeadminPassword); err != nil {
 			return fmt.Errorf("failed to run once recert: %w", err)
 		}
 	}
@@ -138,23 +131,23 @@ func (s *SeedCreator) CreateSeedImage() error {
 		return fmt.Errorf("failed remove all OVN certs folders: %w", err)
 	}
 
-	if err := utils.RunOnce("backup_var", common.BackupChecksDir, s.log, s.backupVar); err != nil {
+	if err := utils.RunOnce("backup_var", common.BackupChecksDir, s.log, s.backupVar, ctx); err != nil {
 		return fmt.Errorf("failed to run once backup_var: %w", err)
 	}
 
-	if err := utils.RunOnce("backup_etc", common.BackupChecksDir, s.log, s.backupEtc); err != nil {
+	if err := utils.RunOnce("backup_etc", common.BackupChecksDir, s.log, s.backupEtc, ctx); err != nil {
 		return fmt.Errorf("failed to run once backup_etc: %w", err)
 	}
 
-	if err := utils.RunOnce("backup_ostree", common.BackupChecksDir, s.log, s.backupOstree); err != nil {
+	if err := utils.RunOnce("backup_ostree", common.BackupChecksDir, s.log, s.backupOstree, ctx); err != nil {
 		return fmt.Errorf("failed to run once backup_ostree: %w", err)
 	}
 
-	if err := utils.RunOnce("backup_rpmostree", common.BackupChecksDir, s.log, s.backupRPMOstree); err != nil {
+	if err := utils.RunOnce("backup_rpmostree", common.BackupChecksDir, s.log, s.backupRPMOstree, ctx); err != nil {
 		return fmt.Errorf("failed to run once backup_rpmostree: %w", err)
 	}
 
-	if err := utils.RunOnce("backup_mco_config", common.BackupChecksDir, s.log, s.backupMCOConfig); err != nil {
+	if err := utils.RunOnce("backup_mco_config", common.BackupChecksDir, s.log, s.backupMCOConfig, ctx); err != nil {
 		return fmt.Errorf("failed to run once backup_mco_config: %w", err)
 	}
 
@@ -164,19 +157,19 @@ func (s *SeedCreator) CreateSeedImage() error {
 	}
 
 	clusterInfoJSON := string(clusterInfoJSONSBytes)
-	if err := s.createAndPushSeedImage(clusterInfoJSON); err != nil {
+	if err := s.createAndPushSeedImage(ctx, clusterInfoJSON); err != nil {
 		return fmt.Errorf("failed to create and push seed image: %w", err)
 	}
 
 	return nil
 }
 
-func (s *SeedCreator) copyConfigurationFiles() error {
+func (s *SeedCreator) copyConfigurationFiles(ctx context.Context) error {
 
-	return s.handleServices()
+	return s.handleServices(ctx)
 }
 
-func (s *SeedCreator) handleServices() error {
+func (s *SeedCreator) handleServices(ctx context.Context) error {
 	dir := filepath.Join(common.InstallationConfigurationFilesDir, "services")
 	return utils.HandleFilesWithCallback(dir, func(path string) error { //nolint:wrapcheck
 		serviceName := filepath.Base(path)
@@ -187,7 +180,7 @@ func (s *SeedCreator) handleServices() error {
 		}
 
 		s.log.Infof("Enabling service %s", serviceName)
-		if _, err := s.ops.SystemctlAction("enable", serviceName); err != nil {
+		if _, err := s.ops.SystemctlAction(ctx, "enable", serviceName); err != nil {
 			return fmt.Errorf("failed to enabling service %s: %w", serviceName, err)
 		}
 		return nil
@@ -230,7 +223,7 @@ func (s *SeedCreator) gatherClusterInfo(ctx context.Context) error {
 		return fmt.Errorf("failed to get additional trust bundle information: %w", err)
 	}
 
-	containerStorageMountpointTarget, err := s.ops.GetContainerStorageTarget()
+	containerStorageMountpointTarget, err := s.ops.GetContainerStorageTarget(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get container storage mountpoint target: %w", err)
 	}
@@ -294,7 +287,7 @@ func (s *SeedCreator) createContainerList(ctx context.Context) error {
 	// purge all unknown image if exists
 	s.log.Info("Cleaning image list")
 	// Don't ever add -a option as we don't want to delete unused images
-	if _, err := s.ops.RunBashInHostNamespace("podman", "image", "prune", "-f"); err != nil {
+	if _, err := s.ops.RunBashInHostNamespace(ctx, "podman", "image", "prune", "-f"); err != nil {
 		return fmt.Errorf("failed to prune with podmamn: %w", err)
 	}
 
@@ -303,7 +296,7 @@ func (s *SeedCreator) createContainerList(ctx context.Context) error {
 	args := []string{"images", "-o", "json", "|", "jq", "-r",
 		"'.images[] | if .repoTags | length > 0 then .repoTags[] else .repoDigests[] end'"}
 
-	output, err := s.ops.RunBashInHostNamespace("crictl", args...)
+	output, err := s.ops.RunBashInHostNamespace(ctx, "crictl", args...)
 	if err != nil {
 		return fmt.Errorf("failed to run crictl with args %s: %w", args, err)
 	}
@@ -335,88 +328,14 @@ func (s *SeedCreator) createContainerList(ctx context.Context) error {
 	return nil
 }
 
-func (s *SeedCreator) stopServices() error {
-	s.log.Info("Stop kubelet service")
-	_, err := s.ops.SystemctlAction("stop", "kubelet.service")
-	if err != nil {
-		return fmt.Errorf("failed to stop kubelet: %w", err)
+func (s *SeedCreator) stopServices(ctx context.Context) error {
+	if err := s.ops.StopClusterServices(ctx); err != nil {
+		return fmt.Errorf("failed to stop cluster services: %w", err)
 	}
-
-	s.log.Info("Disabling kubelet service")
-	_, err = s.ops.SystemctlAction("disable", "kubelet.service")
-	if err != nil {
-		return fmt.Errorf("failed to disable kubelet: %w", err)
-	}
-
-	s.log.Info("Stopping containers and CRI-O runtime.")
-	crioSystemdStatus, err := s.ops.SystemctlAction("is-active", "crio")
-	var exitErr *exec.ExitError
-	// If ExitCode is 3, the command succeeded and told us that crio is down
-	if err != nil && errors.As(err, &exitErr) && exitErr.ExitCode() != 3 {
-		return fmt.Errorf("failed to checking crio status: %w", err)
-	}
-	s.log.Info("crio status is ", crioSystemdStatus)
-	if crioSystemdStatus == "active" {
-		// CRI-O is active, so stop running containers with retry
-		_ = wait.PollUntilContextCancel(context.TODO(), time.Second, true, func(ctx context.Context) (done bool, err error) {
-			s.log.Info("Stop running containers")
-			args := []string{"ps", "-q", "|", "xargs", "--no-run-if-empty", "--max-args", "1", "--max-procs", "10", "crictl", "stop", "--timeout", "5"}
-			_, err = s.ops.RunBashInHostNamespace("crictl", args...)
-			if err != nil {
-				return false, fmt.Errorf("failed to stop running containers: %w", err)
-			}
-			return true, nil
-		})
-
-		// Execute a D-Bus call to stop the CRI-O runtime
-		s.log.Debug("Stopping CRI-O engine")
-		_, err = s.ops.SystemctlAction("stop", "crio.service")
-		if err != nil {
-			return fmt.Errorf("failed to stop crio engine: %w", err)
-		}
-		s.log.Info("Running containers and CRI-O engine stopped successfully.")
-	} else {
-		s.log.Info("Skipping running containers and CRI-O engine already stopped.")
-	}
-
 	return nil
 }
 
-// getVarLibFilelist parses the MCD currentconfig to get the list of managed files under /var/lib
-func (s *SeedCreator) getVarLibFilelist() ([]string, error) {
-	var filelist []string
-	varlibRegex := regexp.MustCompile(`^/var/lib/`)
-
-	data, err := os.ReadFile(common.MCDCurrentConfig)
-	if err != nil {
-		return filelist, fmt.Errorf("unable to read MCD currentconfig: %w", err)
-	}
-
-	var mc mcv1.MachineConfig
-
-	if err := json.Unmarshal(data, &mc); err != nil {
-		return filelist, fmt.Errorf("unable to parse MCD currentconfig: %w", err)
-	}
-
-	if mc.Spec.Config.Raw == nil {
-		return filelist, fmt.Errorf("unable to find config in MCD currentconfig")
-	}
-
-	ign, _, err := ignconfig.Parse(mc.Spec.Config.Raw)
-	if err != nil {
-		return filelist, fmt.Errorf("unable to parse ignition config from MCD currentconfig: %w", err)
-	}
-
-	for _, f := range ign.Storage.Files {
-		if varlibRegex.MatchString(f.Path) {
-			filelist = append(filelist, f.Path)
-		}
-	}
-
-	return filelist, nil
-}
-
-func (s *SeedCreator) backupVar() error {
+func (s *SeedCreator) backupVar(ctx context.Context) error {
 	varTarFile := path.Join(s.backupDir, "var.tgz")
 
 	// Define the 'exclude' patterns
@@ -436,7 +355,7 @@ func (s *SeedCreator) backupVar() error {
 	tarArgs := []string{"czf", varTarFile}
 
 	// Ensure all MCD-managed files in /var/lib are explicitly included, to avoid accidental exclusion
-	if managedfiles, err := s.getVarLibFilelist(); err != nil {
+	if managedfiles, err := utils.GetMCDManagedVarLibFiles(common.MCDCurrentConfig); err != nil {
 		return fmt.Errorf("unable to get list of MCD managed files: %w", err)
 	} else {
 		for _, fname := range managedfiles {
@@ -452,7 +371,7 @@ func (s *SeedCreator) backupVar() error {
 	tarArgs = append(tarArgs, common.TarOpts...)
 
 	// Run the tar command
-	_, err := s.ops.RunBashInHostNamespace("tar", tarArgs...)
+	_, err := s.ops.RunBashInHostNamespace(ctx, "tar", tarArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to run tar for backupVar: %w", err)
 	}
@@ -461,7 +380,7 @@ func (s *SeedCreator) backupVar() error {
 	return nil
 }
 
-func (s *SeedCreator) backupEtc() error {
+func (s *SeedCreator) backupEtc(ctx context.Context) error {
 	s.log.Info("Backing up /etc")
 
 	// Execute 'ostree admin config-diff' command and backup etc.deletions
@@ -482,7 +401,7 @@ func (s *SeedCreator) backupEtc() error {
 
 	args := []string{"admin", "config-diff", "|", "awk", `'$1 == "D" {print "/etc/" $2}'`, ">",
 		path.Join(s.backupDir, "/etc.deletions")}
-	_, err := s.ops.RunBashInHostNamespace("ostree", args...)
+	_, err := s.ops.RunBashInHostNamespace(ctx, "ostree", args...)
 	if err != nil {
 		return fmt.Errorf("failed backing up /etc with args %s: %w", args, err)
 	}
@@ -491,7 +410,7 @@ func (s *SeedCreator) backupEtc() error {
 		"|", "awk", `'$1 != "D" {print "/etc/" $2}'`, "|"}
 	args = append(args, tarArgs...)
 
-	_, err = s.ops.RunBashInHostNamespace("ostree", args...)
+	_, err = s.ops.RunBashInHostNamespace(ctx, "ostree", args...)
 	if err != nil {
 		return fmt.Errorf("failed backing up /etc with args %s: %w", args, err)
 	}
@@ -500,33 +419,36 @@ func (s *SeedCreator) backupEtc() error {
 	return nil
 }
 
-func (s *SeedCreator) backupOstree() error {
+func (s *SeedCreator) backupOstree(ctx context.Context) error {
 	s.log.Info("Backing up ostree")
 	ostreeTar := s.backupDir + "/ostree.tgz"
 
 	// Execute 'tar' command and backup /etc
 	args := []string{"czf", ostreeTar, "-C", "/ostree/repo", "."}
 	args = append(args, common.TarOpts...)
-	if _, err := s.ops.RunBashInHostNamespace("tar", args...); err != nil {
+	if _, err := s.ops.RunBashInHostNamespace(ctx, "tar", args...); err != nil {
 		return fmt.Errorf("failed backing ostree with args %s: %w", args, err)
 	}
 
 	return nil
 }
 
-func (s *SeedCreator) backupRPMOstree() error {
+func (s *SeedCreator) backupRPMOstree(ctx context.Context) error {
 	rpmJSON := s.backupDir + "/rpm-ostree.json"
-	args := append([]string{"status", "-v", "--json"}, ">", rpmJSON)
-	if _, err := s.ops.RunBashInHostNamespace("rpm-ostree", args...); err != nil {
-		return fmt.Errorf("failed to run backup rpmostree with args %s: %w", args, err)
+	output, err := s.ops.RunInHostNamespace(ctx, "rpm-ostree", "status", "-v", "--json")
+	if err != nil {
+		return fmt.Errorf("failed to run backup rpmostree: %w", err)
+	}
+	if err := s.ops.WriteFile(rpmJSON, []byte(output), 0o644); err != nil {
+		return fmt.Errorf("failed to write rpm-ostree backup to %s: %w", rpmJSON, err)
 	}
 	s.log.Info("Backup of rpm-ostree.json created successfully.")
 	return nil
 }
 
-func (s *SeedCreator) backupMCOConfig() error {
+func (s *SeedCreator) backupMCOConfig(ctx context.Context) error {
 	mcoJSON := s.backupDir + "/mco-currentconfig.json"
-	if _, err := s.ops.RunBashInHostNamespace("cp", common.MCDCurrentConfig, mcoJSON); err != nil {
+	if err := s.ops.CopyFile(common.MCDCurrentConfig, mcoJSON, 0o644); err != nil {
 		return fmt.Errorf("failed to backup MCO config: %w", err)
 	}
 	s.log.Info("Backup of mco-currentconfig created successfully.")
@@ -534,16 +456,16 @@ func (s *SeedCreator) backupMCOConfig() error {
 }
 
 // Building and pushing OCI image
-func (s *SeedCreator) createAndPushSeedImage(clusterInfo string) error {
+func (s *SeedCreator) createAndPushSeedImage(ctx context.Context, clusterInfo string) error {
 	s.log.Info("Build and push OCI image to ", s.containerRegistry)
-	s.log.Debug(s.ostreeClient.RpmOstreeVersion()) // If verbose, also dump out current rpm-ostree version available
+	s.log.Debug(s.ostreeClient.RpmOstreeVersion(ctx)) // If verbose, also dump out current rpm-ostree version available
 
 	// Get the current status of rpm-ostree daemon in the host
-	statusRpmOstree, err := s.ostreeClient.QueryStatus()
+	statusRpmOstree, err := s.ostreeClient.QueryStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to query ostree status: %w", err)
 	}
-	if err := s.backupOstreeOrigin(statusRpmOstree); err != nil {
+	if err := s.backupOstreeOrigin(ctx, statusRpmOstree); err != nil {
 		return err
 	}
 
@@ -571,14 +493,14 @@ func (s *SeedCreator) createAndPushSeedImage(clusterInfo string) error {
 		s.backupDir,
 	}
 	_, err = s.ops.RunInHostNamespace(
-		"podman", podmanBuildArgs...)
+		ctx, "podman", podmanBuildArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to build seed image: %w", err)
 	}
 
 	// Push the created OCI image to user's repository
 	_, err = s.ops.RunInHostNamespace(
-		"podman", []string{"push", "--authfile", s.authFile, s.containerRegistry}...)
+		ctx, "podman", []string{"push", "--authfile", s.authFile, s.containerRegistry}...)
 	if err != nil {
 		return fmt.Errorf("failed to push seed image: %w", err)
 	}
@@ -586,7 +508,7 @@ func (s *SeedCreator) createAndPushSeedImage(clusterInfo string) error {
 	return nil
 }
 
-func (s *SeedCreator) backupOstreeOrigin(statusRpmOstree *ostree.Status) error {
+func (s *SeedCreator) backupOstreeOrigin(ctx context.Context, statusRpmOstree *ostree.Status) error {
 
 	// Get OSName for booted ostree deployment
 	bootedOSName := statusRpmOstree.Deployments[0].OSName
@@ -601,11 +523,9 @@ func (s *SeedCreator) backupOstreeOrigin(statusRpmOstree *ostree.Status) error {
 	if err == nil || !os.IsNotExist(err) {
 		return fmt.Errorf("failed to get file info for %s: %w", originFileName, err)
 	}
-	// Execute 'copy' command and backup .origin file
-	_, err = s.ops.RunInHostNamespace(
-		"cp", []string{"/ostree/deploy/" + bootedOSName + "/deploy/" + bootedDeployment + ".origin", originFileName}...)
-	if err != nil {
-		return fmt.Errorf("failed 'copy' command to backup .origin file,: %w", err)
+	originSrcPath := "/ostree/deploy/" + bootedOSName + "/deploy/" + bootedDeployment + ".origin"
+	if err := s.ops.CopyFile(originSrcPath, originFileName, 0o644); err != nil {
+		return fmt.Errorf("failed to backup .origin file: %w", err)
 	}
 	s.log.Info("Backup of .origin created successfully.")
 	return nil
@@ -648,7 +568,7 @@ func (s *SeedCreator) filterCatalogImages(ctx context.Context, images []string) 
 func (s *SeedCreator) removeOvnCertsFolders() error {
 	s.log.Infof("Removing ovn certs folders")
 	dirs := []string{common.OvnNodeCerts, common.MultusCerts}
-	if err := utils.RemoveListOfFolders(s.log, dirs); err != nil {
+	if err := utils.RemoveListOfFiles(s.log, dirs); err != nil {
 		return fmt.Errorf("failed to remove ovn certs in %s: %w", dirs, err)
 	}
 	return nil

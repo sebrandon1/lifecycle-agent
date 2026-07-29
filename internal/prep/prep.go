@@ -2,6 +2,7 @@ package prep
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
-	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 
 	"github.com/openshift-kni/lifecycle-agent/internal/common"
 	"github.com/openshift-kni/lifecycle-agent/internal/ostreeclient"
@@ -50,37 +50,6 @@ func getVersionFromSeedClusterInfoFile(path string) (string, error) {
 	return ci.SeedClusterOCPVersion, nil
 }
 
-// BuildKernelArguementsFromMCOFile reads the kernel arguments from MCO file
-// and builds the string arguments that ostree admin deploy requires
-func buildKernelArgumentsFromMCOFile(path string) ([]string, error) {
-	mc := &mcfgv1.MachineConfig{}
-	if err := utils.ReadYamlOrJSONFile(path, mc); err != nil {
-		return nil, fmt.Errorf("failed to read and decode machine config json file: %w", err)
-	}
-
-	args := make([]string, len(mc.Spec.KernelArguments)*2)
-	for i, karg := range mc.Spec.KernelArguments {
-		// if we don't marshal the karg, `"` won't appear in the kernel arguments after reboot
-		if val, err := json.Marshal(karg); err != nil {
-			return nil, fmt.Errorf("failed to marshal karg %s: %w", karg, err)
-		} else {
-			args[2*i] = "--karg-append"
-			args[2*i+1] = string(val)
-		}
-	}
-
-	if mc.Spec.FIPS {
-		args = append(args,
-			"--karg-append", "fips=1",
-			// This is needed because /boot is on a separate partition https://access.redhat.com/solutions/137833
-			// TODO: Should we have this regardless of FIPS?
-			"--karg-append", "boot=LABEL=boot",
-		)
-	}
-
-	return args, nil
-}
-
 // getDeploymentOriginPath return the path to .origin file e.g:
 // /ostree/deploy/<osname>/deploy/<deployment.id>.origin
 func getDeploymentOriginPath(deploymentDir string) string {
@@ -93,7 +62,7 @@ func removeETCDeletions(mountpoint, deploymentDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open etc.deletions: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -122,11 +91,11 @@ func getDeploymentFromDeploymentID(deploymentID string) (string, error) {
 	return splitted[len(splitted)-1], nil
 }
 
-func SetupStateroot(log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.IClient,
+func SetupStateroot(ctx context.Context, log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.IClient,
 	rpmOstreeClient rpmostreeclient.IClient, seedImage, expectedVersion string, ibi bool) error {
 	log.Info("Start setupstateroot")
 
-	defer ops.UnmountAndRemoveImage(seedImage)
+	defer func() { _ = ops.UnmountAndRemoveImage(ctx, seedImage) }()
 
 	workspaceOutsideChroot, err := os.MkdirTemp(common.PathOutsideChroot("/var/tmp"), "")
 	if err != nil {
@@ -146,13 +115,13 @@ func SetupStateroot(log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.ICli
 	log.Info("workspace:" + workspace)
 
 	if !ibi {
-		if err = ops.RemountSysroot(); err != nil {
+		if err = ops.RemountSysroot(ctx); err != nil {
 			return fmt.Errorf("failed to remount /sysroot: %w", err)
 		}
 
 	}
 
-	mountpoint, err := ops.MountImage(seedImage)
+	mountpoint, err := ops.MountImage(ctx, seedImage)
 	if err != nil {
 		return fmt.Errorf("failed to mount seed image: %w", err)
 	}
@@ -162,7 +131,7 @@ func SetupStateroot(log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.ICli
 		return fmt.Errorf("failed to create ostree repo directory: %w", err)
 	}
 
-	if err := ops.ExtractTarWithSELinux(
+	if err := ops.ExtractTarWithSELinux(ctx,
 		fmt.Sprintf("%s/ostree.tgz", mountpoint), ostreeRepo,
 	); err != nil {
 		return fmt.Errorf("failed to extract ostree.tgz: %w", err)
@@ -194,15 +163,15 @@ func SetupStateroot(log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.ICli
 
 	osname := common.GetStaterootName(expectedVersion)
 
-	if err = ostreeClient.PullLocal(ostreeRepo); err != nil {
+	if err = ostreeClient.PullLocal(ctx, ostreeRepo); err != nil {
 		return fmt.Errorf("failed ostree pull-local: %w", err)
 	}
 
-	if err = ostreeClient.OSInit(osname); err != nil {
+	if err = ostreeClient.OSInit(ctx, osname); err != nil {
 		return fmt.Errorf("failed ostree admin os-init: %w", err)
 	}
 
-	kargs, err := buildKernelArgumentsFromMCOFile(filepath.Join(common.PathOutsideChroot(mountpoint), "mco-currentconfig.json"))
+	kargs, err := utils.BuildKernelArgumentsFromMCOFile(filepath.Join(common.PathOutsideChroot(mountpoint), "mco-currentconfig.json"))
 	if err != nil {
 		return fmt.Errorf("failed to build kargs: %w", err)
 	}
@@ -212,11 +181,11 @@ func SetupStateroot(log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.ICli
 		kargs = append(kargs, "--karg", "ibu="+expectedVersion)
 	}
 
-	if err = ostreeClient.Deploy(osname, seedBootedRef, kargs, rpmOstreeClient, ibi); err != nil {
+	if err = ostreeClient.Deploy(ctx, osname, seedBootedRef, kargs, rpmOstreeClient, ibi); err != nil {
 		return fmt.Errorf("failed ostree admin deploy: %w", err)
 	}
 
-	deploymentDir, err := ostreeClient.GetDeploymentDir(osname)
+	deploymentDir, err := ostreeClient.GetDeploymentDir(ctx, osname)
 	if err != nil {
 		return fmt.Errorf("failed to get deployment dir: %w", err)
 	}
@@ -228,14 +197,14 @@ func SetupStateroot(log logr.Logger, ops ops.Ops, ostreeClient ostreeclient.ICli
 		return fmt.Errorf("failed to restore origin file: %w", err)
 	}
 
-	if err = ops.ExtractTarWithSELinux(
+	if err = ops.ExtractTarWithSELinux(ctx,
 		filepath.Join(mountpoint, "var.tgz"),
 		common.GetStaterootPath(osname),
 	); err != nil {
 		return fmt.Errorf("failed to restore var directory: %w", err)
 	}
 
-	if err := ops.ExtractTarWithSELinux(
+	if err := ops.ExtractTarWithSELinux(ctx,
 		filepath.Join(mountpoint, "etc.tgz"),
 		deploymentDir,
 	); err != nil {

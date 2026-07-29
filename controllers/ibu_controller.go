@@ -174,7 +174,7 @@ func (r *ImageBasedUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	r.Log.Info("Loaded IBU", "name", req.NamespacedName, "version", ibu.GetResourceVersion(), "desired stage", ibu.Spec.Stage)
 
 	var isAfterPivot bool
-	isAfterPivot, err = r.RPMOstreeClient.IsStaterootBooted(common.GetDesiredStaterootName(ibu))
+	isAfterPivot, err = r.RPMOstreeClient.IsStaterootBooted(ctx, common.GetDesiredStaterootName(ibu))
 	if err != nil {
 		return
 	}

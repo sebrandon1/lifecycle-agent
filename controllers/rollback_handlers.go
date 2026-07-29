@@ -18,10 +18,7 @@ package controllers
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -34,82 +31,37 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func (r *ImageBasedUpgradeReconciler) getRollbackAvailabilityExpiration() (time.Time, error) {
-	expiry := time.Time{}
-
-	stateroot, err := r.RPMOstreeClient.GetUnbootedStaterootName()
+func (r *ImageBasedUpgradeReconciler) getRollbackAvailabilityExpiration(ctx context.Context) (time.Time, error) {
+	stateroot, err := r.RPMOstreeClient.GetUnbootedStaterootName(ctx)
 	if err != nil {
-		return expiry, fmt.Errorf("unable to determine unbooted stateroot: %w", err)
+		return time.Time{}, fmt.Errorf("unable to determine onbooted stateroot path for rollback: %w", err)
 	}
 
-	staterootPath := common.PathOutsideChroot(common.GetStaterootPath(stateroot))
-
-	certfiles := []string{
-		"/var/lib/kubelet/pki/kubelet-client-current.pem",
-		"/var/lib/kubelet/pki/kubelet-server-current.pem",
+	expiry, err := common.GetRollbackAvailabilityExpiration(stateroot, r.Log)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get rollback availability expiration for stateroot %q: %w", stateroot, err)
 	}
 
-	for _, certfile := range certfiles {
-		fname := filepath.Join(staterootPath, certfile)
-
-		// Evaluate symlinks, if needed
-		if _, err := os.Stat(fname); err != nil {
-			if _, err = os.Lstat(fname); err != nil {
-				r.Log.Error(err, "unable to read file", "filepath", fname)
-				continue
-			} else if target, err := os.Readlink(fname); err != nil {
-				r.Log.Error(err, "unable to read link", "filepath", fname)
-				continue
-			} else {
-				fname = filepath.Join(staterootPath, target)
-			}
-		}
-
-		certs, err := tls.LoadX509KeyPair(fname, fname)
-		if err != nil {
-			r.Log.Error(err, "failed to parse cert file", "certfile", certfile)
-			continue
-		}
-
-		for _, cert := range certs.Certificate {
-			// Check certificate expiry
-			parsed, err := x509.ParseCertificate(cert)
-			if err != nil {
-				r.Log.Error(err, "failed to parse cert from file", "certfile", certfile)
-				continue
-			}
-
-			if expiry.Equal(time.Time{}) || expiry.After(parsed.NotAfter) {
-				expiry = parsed.NotAfter
-			}
-		}
-	}
-
-	if expiry.Equal(time.Time{}) {
-		return expiry, fmt.Errorf("unable to determine control plane expiry for staterootPath=%s", staterootPath)
-	}
-
-	// Subtract 30 minutes from the expiry time
-	return expiry.Add(time.Minute * -30), nil
+	return expiry, nil
 }
 
 //nolint:unparam
 func (r *ImageBasedUpgradeReconciler) startRollback(ctx context.Context, ibu *ibuv1.ImageBasedUpgrade) (ctrl.Result, error) {
 	utils.SetRollbackStatusInProgress(ibu, "Initiating rollback")
 
-	stateroot, err := r.RPMOstreeClient.GetUnbootedStaterootName()
+	stateroot, err := r.RPMOstreeClient.GetUnbootedStaterootName(ctx)
 	if err != nil {
 		utils.SetRollbackStatusFailed(ibu, err.Error())
 		return doNotRequeue(), nil
 	}
 
-	if err := r.Ops.RemountSysroot(); err != nil {
+	if err := r.Ops.RemountSysroot(ctx); err != nil {
 		utils.SetRollbackStatusFailed(ibu, err.Error())
 		return doNotRequeue(), nil
 	}
 
 	r.Log.Info("Finding unbooted deployment")
-	deploymentIndex, err := r.RPMOstreeClient.GetUnbootedDeploymentIndex()
+	deploymentIndex, err := r.RPMOstreeClient.GetUnbootedDeploymentIndex(ctx)
 	if err != nil {
 		utils.SetRollbackStatusFailed(ibu, err.Error())
 		return doNotRequeue(), nil
@@ -118,10 +70,10 @@ func (r *ImageBasedUpgradeReconciler) startRollback(ctx context.Context, ibu *ib
 	// Set the new default deployment
 	r.Log.Info("Checking for set-default feature")
 
-	if r.OstreeClient.IsOstreeAdminSetDefaultFeatureEnabled() {
+	if r.OstreeClient.IsOstreeAdminSetDefaultFeatureEnabled(ctx) {
 		r.Log.Info("set-default feature available")
 
-		if err = r.OstreeClient.SetDefaultDeployment(deploymentIndex); err != nil {
+		if err = r.OstreeClient.SetDefaultDeployment(ctx, deploymentIndex); err != nil {
 			utils.SetRollbackStatusFailed(ibu, err.Error())
 			return doNotRequeue(), nil
 		}
@@ -156,7 +108,7 @@ func (r *ImageBasedUpgradeReconciler) startRollback(ctx context.Context, ibu *ib
 
 	// Write an event to indicate reboot attempt
 	r.Recorder.Event(ibu, corev1.EventTypeNormal, "Reboot", "System will now reboot for rollback")
-	err = r.RebootClient.RebootToNewStateRoot("rollback")
+	err = r.RebootClient.RebootToNewStateRoot(ctx, "rollback")
 	if err != nil {
 		r.Log.Error(err, "")
 		utils.SetRollbackStatusFailed(ibu, err.Error())
@@ -174,7 +126,7 @@ func (r *ImageBasedUpgradeReconciler) finishRollback(ibu *ibuv1.ImageBasedUpgrad
 
 //nolint:unparam
 func (r *ImageBasedUpgradeReconciler) handleRollback(ctx context.Context, ibu *ibuv1.ImageBasedUpgrade) (ctrl.Result, error) {
-	origStaterootBooted, err := r.RebootClient.IsOrigStaterootBooted(ibu)
+	origStaterootBooted, err := r.RebootClient.IsOrigStaterootBooted(ctx, ibu.Spec.SeedImageRef.Version)
 	if err != nil {
 		utils.SetRollbackStatusFailed(ibu, err.Error())
 		return doNotRequeue(), nil
