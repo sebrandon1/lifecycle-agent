@@ -530,14 +530,14 @@ func TestIPCConfigTwoPhaseHandler_PrePivot(t *testing.T) {
 			AnyTimes()
 
 		mockOps.EXPECT().
-			RunSystemdAction(
+			RunSystemdAction(gomock.Any(),
 				gomock.Any(), gomock.Any(),
 				gomock.Any(), gomock.Any(),
 				gomock.Any(), gomock.Any(),
 				gomock.Any(), gomock.Any(),
 				gomock.Any(), gomock.Any(), gomock.Any(),
 			).
-			DoAndReturn(func(args ...string) (string, error) {
+			DoAndReturn(func(_ context.Context, args ...string) (string, error) {
 				assert.Contains(t, args, "--unit")
 				assert.Contains(t, args, controllerutils.IPConfigPrePivotUnit)
 				assert.Contains(t, args, controllerutils.LcaCliBinaryName)
@@ -592,7 +592,7 @@ func TestIPCConfigTwoPhaseHandler_PrePivot(t *testing.T) {
 		mockOps.EXPECT().CopyFile(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockOps.EXPECT().WriteFile(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		mockOps.EXPECT().
-			RunSystemdAction(
+			RunSystemdAction(gomock.Any(),
 				gomock.Any(), gomock.Any(),
 				gomock.Any(), gomock.Any(),
 				gomock.Any(), gomock.Any(),
@@ -655,7 +655,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 			return errors.New("not healthy")
 		}
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(nil).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(nil).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -698,7 +698,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 			return nil
 		}
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(nil).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(nil).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -789,7 +789,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 		defer func() { CheckHealth = oldHC }()
 		CheckHealth = func(ctx context.Context, c client.Reader, l logr.Logger) error { return errors.New("not healthy") }
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(nil).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(nil).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -854,7 +854,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 		defer func() { CheckHealth = oldHC }()
 		CheckHealth = func(ctx context.Context, c client.Reader, l logr.Logger) error { return nil }
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(nil).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(nil).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -903,7 +903,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 		defer func() { CheckHealth = oldHC }()
 		CheckHealth = func(ctx context.Context, c client.Reader, l logr.Logger) error { return nil }
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(errors.New("disable failed")).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(errors.New("disable failed")).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -945,7 +945,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 		defer func() { CheckHealth = oldHC }()
 		CheckHealth = func(ctx context.Context, c client.Reader, l logr.Logger) error { return nil }
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(nil).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(nil).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -1015,7 +1015,7 @@ func TestIPCConfigTwoPhaseHandler_PostPivot(t *testing.T) {
 		defer func() { CheckHealth = oldHC }()
 		CheckHealth = func(ctx context.Context, c client.Reader, l logr.Logger) error { return errors.New("not healthy") }
 
-		mockReboot.EXPECT().DisableInitMonitor().Return(nil).Times(1)
+		mockReboot.EXPECT().DisableInitMonitor(gomock.Any()).Return(nil).Times(1)
 
 		h := &IPCConfigTwoPhaseHandler{
 			Client:          k8sClient,
@@ -1098,12 +1098,12 @@ func TestIPCConfigStageHandler_Handle(t *testing.T) {
 		assert.NoError(t, k8sClient.Status().Update(ctx, updated))
 
 		mockOps.EXPECT().
-			RunInHostNamespace("nmstatectl", "show", "--json", "-q").
+			RunInHostNamespace(gomock.Any(), "nmstatectl", "show", "--json", "-q").
 			Return(`{"interfaces":[{"name":"br-ex","type":"ovs-interface","bridge":{"port":[{"name":"ens3"},{"name":"patch-br-ex"}]}},{"name":"ens3","type":"ethernet","ipv4":{"enabled":true,"dhcp":false,"address":[{"ip":"192.0.2.10","prefix-length":24}]},"ipv6":{"enabled":false,"dhcp":false,"autoconf":false,"address":[]}}],"routes":{"running":[], "config":[]},"dns-resolver":{"running":{"server":[]},"config":{"server":[]}}}`, nil).
 			Times(1)
 
-		mockRPM.EXPECT().IsStaterootBooted("rhcos").Return(false, nil).Times(1)
-		mockRPM.EXPECT().GetUnbootedStaterootName().Return("some-unbooted", nil).Times(1)
+		mockRPM.EXPECT().IsStaterootBooted(gomock.Any(), "rhcos").Return(false, nil).Times(1)
+		mockRPM.EXPECT().GetUnbootedStaterootName(gomock.Any()).Return("some-unbooted", nil).Times(1)
 		tph.EXPECT().
 			PrePivot(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(requeueWithShortInterval(), nil).
@@ -1165,7 +1165,7 @@ func TestIPCConfigStageHandler_Handle(t *testing.T) {
 
 		// DHCP enabled on br-ex uplink => should fail validation.
 		mockOps.EXPECT().
-			RunInHostNamespace("nmstatectl", "show", "--json", "-q").
+			RunInHostNamespace(gomock.Any(), "nmstatectl", "show", "--json", "-q").
 			Return(`{"interfaces":[{"name":"br-ex","type":"ovs-interface","bridge":{"port":[{"name":"ens3"},{"name":"patch-br-ex"}]},"ipv4":{"enabled":true,"dhcp":true,"address":[{"ip":"192.0.2.10","prefix-length":24}]}},{"name":"ens3","type":"ethernet","ipv4":{"enabled":true,"dhcp":false,"address":[{"ip":"192.0.2.10","prefix-length":24}]},"ipv6":{"enabled":false,"dhcp":false,"autoconf":false,"address":[]}}],"routes":{"running":[], "config":[]},"dns-resolver":{"running":{"server":[]},"config":{"server":[]}}}`, nil).
 			Times(1)
 
@@ -1222,12 +1222,12 @@ func TestIPCConfigStageHandler_Handle(t *testing.T) {
 		k8sClient := newFakeClientWithStatus(t, scheme, ipc, ibu, node, mc)
 
 		mockOps.EXPECT().
-			RunInHostNamespace("nmstatectl", "show", "--json", "-q").
+			RunInHostNamespace(gomock.Any(), "nmstatectl", "show", "--json", "-q").
 			Return(`{"interfaces":[{"name":"br-ex","type":"ovs-interface","bridge":{"port":[{"name":"ens3"},{"name":"patch-br-ex"}]}},{"name":"ens3","type":"ethernet","ipv4":{"enabled":true,"dhcp":false,"address":[{"ip":"192.0.2.10","prefix-length":24}]},"ipv6":{"enabled":false,"dhcp":false,"autoconf":false,"address":[]}}],"routes":{"running":[], "config":[]},"dns-resolver":{"running":{"server":[]},"config":{"server":[]}}}`, nil).
 			Times(1)
 
-		mockRPM.EXPECT().IsStaterootBooted("rhcos").Return(false, nil).Times(1)
-		mockRPM.EXPECT().GetUnbootedStaterootName().Return("some-unbooted", nil).Times(1)
+		mockRPM.EXPECT().IsStaterootBooted(gomock.Any(), "rhcos").Return(false, nil).Times(1)
+		mockRPM.EXPECT().GetUnbootedStaterootName(gomock.Any()).Return("some-unbooted", nil).Times(1)
 
 		tph := NewMockIPConfigTwoPhaseHandlerInterface(gc)
 		tph.EXPECT().
@@ -1266,8 +1266,8 @@ func TestIPCConfigStageHandler_Handle(t *testing.T) {
 		controllerutils.SetIPConfigStatusInProgress(ipc, "Configuration is in progress")
 		k8sClient := newFakeClientWithStatus(t, scheme, ipc)
 
-		mockRPM.EXPECT().IsStaterootBooted("rhcos").Return(false, nil).Times(1)
-		mockRPM.EXPECT().GetUnbootedStaterootName().Return("some-unbooted", nil).Times(1)
+		mockRPM.EXPECT().IsStaterootBooted(gomock.Any(), "rhcos").Return(false, nil).Times(1)
+		mockRPM.EXPECT().GetUnbootedStaterootName(gomock.Any()).Return("some-unbooted", nil).Times(1)
 
 		tph := NewMockIPConfigTwoPhaseHandlerInterface(gc)
 		tph.EXPECT().
@@ -1309,8 +1309,8 @@ func TestIPCConfigStageHandler_Handle(t *testing.T) {
 		k8sClient := newFakeClientWithStatus(t, scheme, ipc, node, mc)
 
 		// Transition requested should still be false since we're already in progress; only boot check should be called.
-		mockRPM.EXPECT().IsStaterootBooted("rhcos").Return(true, nil).Times(1)
-		mockRPM.EXPECT().GetUnbootedStaterootName().Return("some-unbooted", nil).Times(1)
+		mockRPM.EXPECT().IsStaterootBooted(gomock.Any(), "rhcos").Return(true, nil).Times(1)
+		mockRPM.EXPECT().GetUnbootedStaterootName(gomock.Any()).Return("some-unbooted", nil).Times(1)
 
 		tph := NewMockIPConfigTwoPhaseHandlerInterface(gc)
 		tph.EXPECT().
@@ -1355,8 +1355,8 @@ func TestIPCConfigStageHandler_Handle(t *testing.T) {
 		controllerutils.SetIPConfigStatusInProgress(ipc, "Configuration is in progress")
 		k8sClient := newFakeClientWithStatus(t, scheme, ipc)
 
-		mockRPM.EXPECT().IsStaterootBooted("rhcos").Return(false, nil).Times(1)
-		mockRPM.EXPECT().GetUnbootedStaterootName().Return("some-unbooted", nil).Times(1)
+		mockRPM.EXPECT().IsStaterootBooted(gomock.Any(), "rhcos").Return(false, nil).Times(1)
+		mockRPM.EXPECT().GetUnbootedStaterootName(gomock.Any()).Return("some-unbooted", nil).Times(1)
 
 		tph := NewMockIPConfigTwoPhaseHandlerInterface(gc)
 		tph.EXPECT().
