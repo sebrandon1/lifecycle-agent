@@ -11,13 +11,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/openshift-kni/lifecycle-agent/internal/extramanifest"
 
 	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/openshift-kni/lifecycle-agent/api/seedreconfig"
 
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -69,9 +69,9 @@ func NewPostPivot(scheme *runtime.Scheme, log *logrus.Logger, ops ops.Ops, authF
 }
 
 var (
-	dnsmasqOverrides   = common.DnsmasqOverrides
+	dnsmasqOverrides   = "/etc/default/sno_dnsmasq_configuration_overrides"
 	nmConnectionFolder = common.NMConnectionFolder
-	nodePrimaryIPFile  = "/run/nodeip-configuration/primary-ip"
+	nodeIpFile         = "/run/nodeip-configuration/primary-ip"
 	nodeIPHintFile     = "/etc/default/nodeip-configuration"
 )
 
@@ -87,39 +87,8 @@ const (
 	nmService      = "NetworkManager.service"
 	dnsmasqService = "dnsmasq.service"
 
-	localhost         = "localhost"
-	kubeletConfigFile = "/etc/systemd/system/kubelet.service.d/20-nodenet.conf"
+	localhost = "localhost"
 )
-
-// seedClusterInfoNodeIPs Handles backward compatibility with the old seed cluster info file,
-// containing a single IP address (NodeIP).
-func seedClusterInfoNodeIPs(seedClusterInfo *seedclusterinfo.SeedClusterInfo) []string {
-	if len(seedClusterInfo.NodeIPs) > 0 {
-		return seedClusterInfo.NodeIPs
-	}
-
-	//nolint:staticcheck // backwards compatibility with deprecated field
-	if seedClusterInfo.NodeIP != "" {
-		return []string{seedClusterInfo.NodeIP} //nolint:staticcheck // backwards compatibility with deprecated field
-	}
-
-	return []string{}
-}
-
-// seedReconfigurationNodeIPs Handles backward compatibility with the old seed reconfiguration file,
-// containing a single IP address (NodeIP).
-func seedReconfigurationNodeIPs(seedReconfiguration *clusterconfig_api.SeedReconfiguration) []string {
-	if len(seedReconfiguration.NodeIPs) > 0 {
-		return seedReconfiguration.NodeIPs
-	}
-
-	//nolint:staticcheck // backwards compatibility with deprecated field
-	if seedReconfiguration.NodeIP != "" {
-		return []string{seedReconfiguration.NodeIP} //nolint:staticcheck // backwards compatibility with deprecated field
-	}
-
-	return []string{}
-}
 
 func (p *PostPivot) PostPivotConfiguration(ctx context.Context) error {
 
@@ -132,8 +101,6 @@ func (p *PostPivot) PostPivotConfiguration(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get seed info from %s, err: %w", "", err)
 	}
-	seedClusterInfo.NodeIPs = seedClusterInfoNodeIPs(seedClusterInfo)
-	p.log.Infof("Seed cluster info node IPs: %v", seedClusterInfo.NodeIPs)
 
 	p.log.Info("Reading seed reconfiguration info")
 	seedReconfiguration, err := utils.ReadSeedReconfigurationFromFile(
@@ -141,8 +108,6 @@ func (p *PostPivot) PostPivotConfiguration(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get cluster info from %s, err: %w", "", err)
 	}
-	seedReconfiguration.NodeIPs = seedReconfigurationNodeIPs(seedReconfiguration)
-	p.log.Infof("Seed reconfiguration node IPs: %v", seedReconfiguration.NodeIPs)
 
 	if err := utils.RunOnce("setSSHKey", p.workingDir, p.log, p.setSSHKey,
 		ctx, seedReconfiguration.SSHKey, sshKeyEarlyAccessFile); err != nil {
@@ -156,10 +121,6 @@ func (p *PostPivot) PostPivotConfiguration(ctx context.Context) error {
 
 	if err := p.networkConfiguration(ctx, seedReconfiguration); err != nil {
 		return fmt.Errorf("failed to configure networking, err: %w", err)
-	}
-
-	if err := validateIPAndMachineNetworkConsistency(seedClusterInfo, seedReconfiguration); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
 	}
 
 	if seedReconfiguration.APIVersion != clusterconfig_api.SeedReconfigurationVersion {
@@ -178,10 +139,6 @@ func (p *PostPivot) PostPivotConfiguration(ctx context.Context) error {
 
 	if err := utils.RunOnce("recert", p.workingDir, p.log, p.recert, ctx, seedReconfiguration, seedClusterInfo); err != nil {
 		return fmt.Errorf("failed to run once recert for post pivot: %w", err)
-	}
-
-	if err := p.restartChronydService(ctx, seedReconfiguration.ChronyConfig); err != nil {
-		return fmt.Errorf("failed to restart chronyd service: %w", err)
 	}
 
 	if err := p.applyServerSSHKeys(seedReconfiguration.ServerSSHKeys); err != nil {
@@ -204,7 +161,7 @@ func (p *PostPivot) PostPivotConfiguration(ctx context.Context) error {
 	if _, err := p.ops.SystemctlAction(ctx, "enable", "kubelet", "--now"); err != nil {
 		return fmt.Errorf("failed to enable kubelet: %w", err)
 	}
-	utils.WaitForApi(ctx, client, p.log)
+	p.waitForApi(ctx, client)
 
 	if err := p.deleteAllOldMirrorResources(ctx, client); err != nil {
 		return fmt.Errorf("failed to all old mirror resources: %w", err)
@@ -266,9 +223,8 @@ func (p *PostPivot) recert(ctx context.Context, seedReconfiguration *clusterconf
 		return fmt.Errorf("failed to populate crypto dir from seed reconfiguration: %w", err)
 	}
 
-	certManagerCryptoDir := path.Join(p.workingDir, common.ClusterConfigDir, common.CertManagerCryptoDir)
 	if err := recert.CreateRecertConfigFile(seedReconfiguration, seedClusterInfo, kubeconfigCryptoDir,
-		p.workingDir, certManagerCryptoDir); err != nil {
+		p.workingDir); err != nil {
 		return fmt.Errorf("failed to create recert config file: %w", err)
 	}
 
@@ -303,7 +259,7 @@ func (p *PostPivot) recert(ctx context.Context, seedReconfiguration *clusterconf
 	return nil
 }
 
-func (p *PostPivot) applyServerSSHKeys(serverSSHKeys []clusterconfig_api.ServerSSHKey) error {
+func (p *PostPivot) applyServerSSHKeys(serverSSHKeys []seedreconfig.ServerSSHKey) error {
 	if len(serverSSHKeys) == 0 {
 		p.log.Infof("No server ssh keys were provided, fresh keys already regenerated by recert, skipping")
 		return nil
@@ -381,15 +337,11 @@ func (p *PostPivot) setProxyAndProxyStatus(seedReconfig *clusterconfig_api.SeedR
 		fmt.Sprintf("api-int.%s.%s", seedReconfig.ClusterName, seedReconfig.BaseDomain),
 	)
 
-	machineNetworks := getMachineNetworksFromSeedReconfig(seedReconfig)
-	if len(machineNetworks) == 0 {
-		return fmt.Errorf("machineNetworks is empty, must be provided in case of proxy")
-	}
+	if seedReconfig.MachineNetwork == "" {
+		return fmt.Errorf("machineNetwork is empty, must be provided in case of proxy")
 
-	for _, machineNetwork := range machineNetworks {
-		set.Insert(machineNetwork)
 	}
-
+	set.Insert(seedReconfig.MachineNetwork)
 	for _, nss := range append(seedClusterInfo.ServiceNetworks, seedClusterInfo.ClusterNetworks...) {
 		set.Insert(nss)
 	}
@@ -416,19 +368,20 @@ func (p *PostPivot) postRecertCommands(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to run update-ca-trust after recert: %w", err)
 	}
+
 	return nil
 }
 
-func (p *PostPivot) restartChronydService(ctx context.Context, chronyConfig string) error {
-	if chronyConfig == "" {
-		p.log.Info("Chrony config is empty, skipping restart of chronyd service")
-		return nil
-	}
-	p.log.Info("Restarting chronyd service")
-	if _, err := p.ops.SystemctlAction(ctx, "restart", "chronyd"); err != nil {
-		return fmt.Errorf("failed to restart chronyd: %w", err)
-	}
-	return nil
+func (p *PostPivot) waitForApi(ctx context.Context, client runtimeclient.Client) {
+	p.log.Info("Start waiting for api")
+	_ = wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (done bool, err error) {
+		p.log.Info("waiting for api")
+		nodes := &v1.NodeList{}
+		if err = client.List(ctx, nodes); err == nil {
+			return true, nil
+		}
+		return false, nil
+	})
 }
 
 func (p *PostPivot) applyManifests(ctx context.Context, mPath string, dynamicClient dynamic.Interface, restMapper meta.RESTMapper) error {
@@ -676,7 +629,7 @@ func (p *PostPivot) changeRegistryInCSVDeployment(ctx context.Context, client ru
 func (p *PostPivot) cleanup() error {
 	p.log.Info("Cleaning up")
 	listOfDirs := []string{p.workingDir, common.SeedDataDir}
-	if err := utils.RemoveListOfFiles(p.log, listOfDirs); err != nil {
+	if err := utils.RemoveListOfFolders(p.log, listOfDirs); err != nil {
 		return fmt.Errorf("failed to cleanup in postpivot %s: %w", listOfDirs, err)
 	}
 	return nil
@@ -709,16 +662,11 @@ func (p *PostPivot) setNewClusterID(ctx context.Context, client runtimeclient.Cl
 // For new configuration to apply we must restart NM and dnsmasq
 func (p *PostPivot) setDnsMasqConfiguration(seedReconfiguration *clusterconfig_api.SeedReconfiguration,
 	dnsmasqOverridesFiles string) error {
-	if len(seedReconfiguration.NodeIPs) == 0 {
-		return fmt.Errorf("at least one IP is required to set up DNSMASQ")
-	}
-	primaryIP := seedReconfiguration.NodeIPs[0]
-	p.log.Infof("Setting new dnsmasq and forcedns dispatcher script configuration for %s", primaryIP)
-
+	p.log.Info("Setting new dnsmasq and forcedns dispatcher script configuration")
 	config := []string{
 		fmt.Sprintf("SNO_CLUSTER_NAME_OVERRIDE=%s", seedReconfiguration.ClusterName),
 		fmt.Sprintf("SNO_BASE_DOMAIN_OVERRIDE=%s", seedReconfiguration.BaseDomain),
-		fmt.Sprintf("SNO_DNSMASQ_IP_OVERRIDE=%s", primaryIP),
+		fmt.Sprintf("SNO_DNSMASQ_IP_OVERRIDE=%s", seedReconfiguration.NodeIP),
 	}
 
 	if err := os.WriteFile(dnsmasqOverridesFiles, []byte(strings.Join(config, "\n")), 0o600); err != nil {
@@ -728,25 +676,15 @@ func (p *PostPivot) setDnsMasqConfiguration(seedReconfiguration *clusterconfig_a
 	return nil
 }
 
-// setNodeIPsIfNotProvided will run nodeip configuration service on demand in case seedReconfiguration node ip is empty
-// nodeip-configuration service is in charge of setting kubelet and crio ip, this ip we will take as NodeIPs
-func (p *PostPivot) setNodeIPsIfNotProvided(
-	ctx context.Context,
-	seedReconfiguration *clusterconfig_api.SeedReconfiguration,
-) error {
-	if len(seedReconfiguration.NodeIPs) != 0 {
-		p.log.Infof("Node IPs are already set to %v, skipping", seedReconfiguration.NodeIPs)
+// setNodeIPIfNotProvided will run nodeip configuration service on demand in case seedReconfiguration node ip is empty
+// nodeip-configuration service in on charge of setting kubelet and crio ip, this ip we will take as NodeIP
+func (p *PostPivot) setNodeIPIfNotProvided(ctx context.Context,
+	seedReconfiguration *clusterconfig_api.SeedReconfiguration, ipFile string) error {
+	if seedReconfiguration.NodeIP != "" {
 		return nil
 	}
 
-	// The existence of the primary IP file is the condition for whether the nodeip-configuration
-	// service has already run. While the service also updates the kubelet config file with the chosen IPs, that file
-	// might exist beforehand. The primary IP file is created only *after* the IPs are written
-	// to the kubelet config file, making it a reliable indicator of completion.
-	// We use the primary IP file as a definitive check, then read from the kubelet config file.
-	// See: https://github.com/openshift/baremetal-runtimecfg/blob/e898adc576b343a214aff860e349f9bba3a125d4/cmd/runtimecfg/node-ip.go#L107
-	// and: https://github.com/openshift/baremetal-runtimecfg/blob/e898adc576b343a214aff860e349f9bba3a125d4/cmd/runtimecfg/node-ip.go#L148
-	if _, err := os.Stat(nodePrimaryIPFile); err != nil {
+	if _, err := os.Stat(ipFile); err != nil {
 		_, err := p.ops.SystemctlAction(ctx, "start", "nodeip-configuration")
 		if err != nil {
 			return fmt.Errorf("failed to start nodeip-configuration service, err %w", err)
@@ -754,61 +692,24 @@ func (p *PostPivot) setNodeIPsIfNotProvided(
 
 		p.log.Info("Start waiting for nodeip service to choose node ip")
 		_ = wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (done bool, err error) {
-			if _, err := os.Stat(nodePrimaryIPFile); err != nil {
+			if _, err := os.Stat(ipFile); err != nil {
 				return false, nil
 			}
 			return true, nil
 		})
 	}
 
-	b, err := os.ReadFile(kubeletConfigFile)
+	b, err := os.ReadFile(ipFile)
 	if err != nil {
-		return fmt.Errorf("failed to read kubelet config from %s, err: %w", kubeletConfigFile, err)
+		return fmt.Errorf("failed to read ip from %s, err: %w", ipFile, err)
+	}
+	ip := net.ParseIP(string(b))
+	if ip == nil {
+		return fmt.Errorf("failed to parse ip %s from %s", string(b), ipFile)
 	}
 
-	content := string(b)
-	nodeIPs, err := parseKubeletNodeIPs(content)
-	if err != nil {
-		return fmt.Errorf("failed to parse node IPs from kubelet config: %w", err)
-	}
-
-	p.log.Infof("Node IPs are set to %v", nodeIPs)
-
-	// the IPs slice is ordered such that the primary IP is the first one.
-	// It is important for both DNSMASQ and recert.
-	seedReconfiguration.NodeIPs = nodeIPs
-
+	seedReconfiguration.NodeIP = ip.String()
 	return nil
-}
-
-// parseKubeletNodeIPs parses KUBELET_NODE_IP and KUBELET_NODE_IPS from kubelet service config
-func parseKubeletNodeIPs(content string) ([]string, error) {
-	var nodeIPs []string
-
-	lines := strings.Split(content, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "Environment=") {
-			// Parse environment variables from the line
-			// Format: Environment="KUBELET_NODE_IP=192.168.127.172" "KUBELET_NODE_IPS=192.168.127.172,1001:db9::3c"
-			if match := regexp.MustCompile(`"KUBELET_NODE_IPS=([^"]+)"`).FindStringSubmatch(line); len(match) > 1 {
-				nodeIPsStr := match[1]
-				nodeIPs = strings.Split(nodeIPsStr, ",")
-				for i, ip := range nodeIPs {
-					nodeIPs[i] = strings.TrimSpace(ip)
-				}
-			} else if match := regexp.MustCompile(`"KUBELET_NODE_IP=([^"]+)"`).FindStringSubmatch(line); len(match) > 1 {
-				// Fall back to single IP if KUBELET_NODE_IPS is not present
-				nodeIPs = []string{strings.TrimSpace(match[1])}
-			}
-		}
-	}
-
-	if len(nodeIPs) == 0 {
-		return nil, fmt.Errorf("no KUBELET_NODE_IP or KUBELET_NODE_IPS found in kubelet config")
-	}
-
-	return nodeIPs, nil
 }
 
 // setSSHKey  sets ssh public key provided by user in 2 operations:
@@ -999,32 +900,20 @@ func (p *PostPivot) copyNMConnectionFiles(source, dest string) error {
 	return nil
 }
 
-// setNodeIpHint writes provided subnets to nodeIPHintFile
-func (p *PostPivot) setNodeIpHint(machineNetworks []string) error {
-	if len(machineNetworks) == 0 {
+// setNodeIpHint writes provided subnet to nodeIPHintFile
+func (p *PostPivot) setNodeIpHint(machineNetwork string) error {
+	if machineNetwork == "" {
 		p.log.Infof("No machine network was provided, skipping setting node ip hint")
 		return nil
 	}
 
-	var ips []string
-	for _, machineNetwork := range machineNetworks {
-		ip, _, err := net.ParseCIDR(machineNetwork)
-		if err != nil {
-			return fmt.Errorf("failed to parse machine network %s, err: %w", machineNetwork, err)
-		}
-		ips = append(ips, ip.String())
+	ip, _, err := net.ParseCIDR(machineNetwork)
+	if err != nil {
+		return fmt.Errorf("failed to parse machine network %s, err: %w", machineNetwork, err)
 	}
-
-	// Join IPs with spaces for dual-stack support: "KUBELET_NODEIP_HINT=<ip1> <ip2>"
-	// This is used as an argument in
-	// https://github.com/openshift/machine-config-operator/blob/5a97a9a29a99e93f15b55242fefb7b41da4a4a82/templates/common/_base/units/nodeip-configuration.service.yaml#L34
-	// which is later used in
-	// https://github.com/openshift/baremetal-runtimecfg/blob/e898adc576b343a214aff860e349f9bba3a125d4/cmd/runtimecfg/node-ip.go#L112
-	ipsHint := strings.Join(ips, " ")
-	p.log.Infof("Writing machine network IPs %s into %s", ipsHint, nodeIPHintFile)
-
-	if err := os.WriteFile(nodeIPHintFile, []byte(fmt.Sprintf("KUBELET_NODEIP_HINT=%s", ipsHint)), 0o600); err != nil {
-		return fmt.Errorf("failed to write machine network IPs %s to %s, err %w", ipsHint, nodeIPHintFile, err)
+	p.log.Infof("Writing machine network cidr %s into %s", ip, nodeIPHintFile)
+	if err := os.WriteFile(nodeIPHintFile, []byte(fmt.Sprintf("KUBELET_NODEIP_HINT=%s", ip)), 0o600); err != nil {
+		return fmt.Errorf("failed to write machine network cidr %s to %s, err %w", machineNetwork, nodeIPHintFile, err)
 	}
 	return nil
 }
@@ -1058,11 +947,11 @@ func (p *PostPivot) networkConfiguration(ctx context.Context, seedReconfiguratio
 		return err
 	}
 
-	if err := p.setNodeIpHint(getMachineNetworksFromSeedReconfig(seedReconfiguration)); err != nil {
+	if err := p.setNodeIpHint(seedReconfiguration.MachineNetwork); err != nil {
 		return err
 	}
 
-	if err := p.setNodeIPsIfNotProvided(ctx, seedReconfiguration); err != nil {
+	if err := p.setNodeIPIfNotProvided(ctx, seedReconfiguration, nodeIpFile); err != nil {
 		return err
 	}
 
@@ -1125,110 +1014,4 @@ func (p *PostPivot) setNodeLabels(ctx context.Context, client runtimeclient.Clie
 		return fmt.Errorf("failed to patch node with new labels %w", err)
 	}
 	return nil
-}
-
-// getMachineNetworksFromSeedReconfig returns machine networks with backward compatibility
-func getMachineNetworksFromSeedReconfig(seedReconfig *clusterconfig_api.SeedReconfiguration) []string {
-	// Prefer the new list field if it's populated
-	if len(seedReconfig.MachineNetworks) > 0 {
-		return seedReconfig.MachineNetworks
-	}
-	// Fall back to the old single field for backward compatibility
-	//nolint:staticcheck // backwards compatibility with deprecated field
-	if seedReconfig.MachineNetwork != "" {
-		return []string{seedReconfig.MachineNetwork} //nolint:staticcheck // backwards compatibility with deprecated field
-	}
-	return []string{}
-}
-
-// validateIPAndMachineNetworkConsistency validates the amount and family order of node IPs and machine networks
-// across seed cluster info and seed reconfiguration, according to the following rules:
-// 1) seedClusterInfo.NodeIPs and seedReconfiguration.NodeIPs must have the same length, and at each index the IP family must match
-// 2) seedReconfiguration.MachineNetworks length must equal seedReconfiguration.NodeIPs length, and at each index the family must match
-// 3) If seedClusterInfo.MachineNetworks is non-empty, it must have the same length as seedReconfiguration.MachineNetworks, and at each index the family must match
-func validateIPAndMachineNetworkConsistency(seedClusterInfo *seedclusterinfo.SeedClusterInfo, seedReconfiguration *clusterconfig_api.SeedReconfiguration) error {
-	seedIPs := seedClusterInfo.NodeIPs
-	reconfigIPs := seedReconfiguration.NodeIPs
-
-	if len(seedIPs) == 0 || len(reconfigIPs) == 0 {
-		return fmt.Errorf("node IPs must be provided in both seedClusterInfo and seedReconfiguration")
-	}
-
-	if len(seedIPs) != len(reconfigIPs) {
-		return fmt.Errorf("node IPs count mismatch: seed has %d, reconfiguration has %d", len(seedIPs), len(reconfigIPs))
-	}
-
-	for i := range seedIPs {
-		seedFam, err := ipFamilyFromIP(seedIPs[i])
-		if err != nil {
-			return fmt.Errorf("invalid seed node IP at index %d: %w", i, err)
-		}
-		reconfFam, err := ipFamilyFromIP(reconfigIPs[i])
-		if err != nil {
-			return fmt.Errorf("invalid reconfiguration node IP at index %d: %w", i, err)
-		}
-		if seedFam != reconfFam {
-			return fmt.Errorf("node IP family mismatch at index %d: seed has %s, reconfiguration has %s", i, seedFam, reconfFam)
-		}
-	}
-
-	// Rule 2: machine networks in reconfiguration must match the number and order (by family) of IPs
-	reconfigMNs := getMachineNetworksFromSeedReconfig(seedReconfiguration)
-	if len(reconfigMNs) != len(reconfigIPs) {
-		return fmt.Errorf("machineNetworks count (%d) must equal node IPs count (%d)", len(reconfigMNs), len(reconfigIPs))
-	}
-	for i := range reconfigMNs {
-		mnFam, err := ipFamilyFromCIDR(reconfigMNs[i])
-		if err != nil {
-			return fmt.Errorf("invalid reconfiguration machineNetwork at index %d: %w", i, err)
-		}
-		ipFam, _ := ipFamilyFromIP(reconfigIPs[i])
-		if mnFam != ipFam {
-			return fmt.Errorf("machineNetwork family at index %d (%s) must match node IP family (%s)", i, mnFam, ipFam)
-		}
-	}
-
-	// Rule 3: if seedClusterInfo has machine networks, validate count and family order against reconfiguration
-	if len(seedClusterInfo.MachineNetworks) > 0 {
-		if len(seedClusterInfo.MachineNetworks) != len(reconfigMNs) {
-			return fmt.Errorf("seed machineNetworks count (%d) must equal reconfiguration machineNetworks count (%d)", len(seedClusterInfo.MachineNetworks), len(reconfigMNs))
-		}
-		for i := range seedClusterInfo.MachineNetworks {
-			seedMNFam, err := ipFamilyFromCIDR(seedClusterInfo.MachineNetworks[i])
-			if err != nil {
-				return fmt.Errorf("invalid seed machineNetwork at index %d: %w", i, err)
-			}
-			reconfMNFam, err := ipFamilyFromCIDR(reconfigMNs[i])
-			if err != nil {
-				return fmt.Errorf("invalid reconfiguration machineNetwork at index %d: %w", i, err)
-			}
-			if seedMNFam != reconfMNFam {
-				return fmt.Errorf("machineNetwork family mismatch at index %d: seed has %s, reconfiguration has %s", i, seedMNFam, reconfMNFam)
-			}
-		}
-	}
-
-	return nil
-}
-
-func ipFamilyFromIP(ipStr string) (string, error) {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return "", fmt.Errorf("invalid IP %q", ipStr)
-	}
-	if ip.To4() != nil {
-		return "ipv4", nil
-	}
-	return "ipv6", nil
-}
-
-func ipFamilyFromCIDR(cidr string) (string, error) {
-	ip, _, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return "", fmt.Errorf("invalid CIDR %q: %w", cidr, err)
-	}
-	if ip.To4() != nil {
-		return "ipv4", nil
-	}
-	return "ipv6", nil
 }

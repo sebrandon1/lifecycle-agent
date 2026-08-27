@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 
 	"github.com/openshift-kni/lifecycle-agent/internal/common"
 	"github.com/openshift-kni/lifecycle-agent/internal/ostreeclient"
@@ -48,6 +49,35 @@ func getVersionFromSeedClusterInfoFile(path string) (string, error) {
 		return "", fmt.Errorf("failed to read and decode ClusterInfo file: %w", err)
 	}
 	return ci.SeedClusterOCPVersion, nil
+}
+
+func buildKernelArgumentsFromMCOFile(path string) ([]string, error) {
+	mc := &mcfgv1.MachineConfig{}
+	if err := utils.ReadYamlOrJSONFile(path, mc); err != nil {
+		return nil, fmt.Errorf("failed to read and decode machine config json file: %w", err)
+	}
+
+	args := make([]string, len(mc.Spec.KernelArguments)*2)
+	for i, karg := range mc.Spec.KernelArguments {
+		// if we don't marshal the karg, `"` won't appear in the kernel arguments after reboot
+		if val, err := json.Marshal(karg); err != nil {
+			return nil, fmt.Errorf("failed to marshal karg %s: %w", karg, err)
+		} else {
+			args[2*i] = "--karg-append"
+			args[2*i+1] = string(val)
+		}
+	}
+
+	if mc.Spec.FIPS {
+		args = append(args,
+			"--karg-append", "fips=1",
+			// This is needed because /boot is on a separate partition https://access.redhat.com/solutions/137833
+			// TODO: Should we have this regardless of FIPS?
+			"--karg-append", "boot=LABEL=boot",
+		)
+	}
+
+	return args, nil
 }
 
 // getDeploymentOriginPath return the path to .origin file e.g:
@@ -171,7 +201,7 @@ func SetupStateroot(ctx context.Context, log logr.Logger, ops ops.Ops, ostreeCli
 		return fmt.Errorf("failed ostree admin os-init: %w", err)
 	}
 
-	kargs, err := utils.BuildKernelArgumentsFromMCOFile(filepath.Join(common.PathOutsideChroot(mountpoint), "mco-currentconfig.json"))
+	kargs, err := buildKernelArgumentsFromMCOFile(filepath.Join(common.PathOutsideChroot(mountpoint), "mco-currentconfig.json"))
 	if err != nil {
 		return fmt.Errorf("failed to build kargs: %w", err)
 	}

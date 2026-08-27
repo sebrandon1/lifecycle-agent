@@ -341,12 +341,6 @@ var getStaterootVarPath = func(stateroot string) string {
 // CheckHealth helper func to call HealthChecks
 var CheckHealth = healthcheck.HealthChecks
 
-// CheckMandatoryHealth runs pre-restore mandatory checks (COs, MCP, SRIOV, OADP)
-var CheckMandatoryHealth = healthcheck.MandatoryHealthChecks
-
-// CheckDeferredHealth runs post-restore deferred checks (Node, CSVs, CSRs)
-var CheckDeferredHealth = healthcheck.DeferredHealthChecks
-
 func (u *UpgHandler) autoRollbackIfEnabled(ctx context.Context, ibu *ibuv1.ImageBasedUpgrade, msg string) {
 	// Check whether auto-rollback is disabled using annotation
 	if val, exists := ibu.GetAnnotations()[common.AutoRollbackOnFailureUpgradeCompletionAnnotation]; exists {
@@ -450,12 +444,6 @@ func (u *UpgHandler) PostPivot(ctx context.Context, ibu *ibuv1.ImageBasedUpgrade
 		// The restore process has not been completed yet, requeue
 		utils.SetUpgradeStatusInProgress(ibu, "Restore of Application Data is in progress")
 		return result, nil
-	}
-
-	u.Log.Info("Running deferred health checks (post-restore)")
-	if err := CheckDeferredHealth(ctx, u.NoncachedClient, u.Log); err != nil {
-		utils.SetUpgradeStatusInProgress(ibu, fmt.Sprintf("Waiting for system to fully stabilize: %s", err.Error()))
-		return requeueWithHealthCheckInterval(), nil
 	}
 
 	if err := u.RebootClient.DisableInitMonitor(ctx); err != nil {
