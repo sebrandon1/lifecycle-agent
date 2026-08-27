@@ -17,12 +17,8 @@ limitations under the License.
 package cmd
 
 import (
-	"context"
 	"fmt"
-	"os"
-	"strings"
 
-	"github.com/openshift-kni/lifecycle-agent/internal/common"
 	"github.com/openshift-kni/lifecycle-agent/lca-cli/initmonitor"
 	"github.com/openshift-kni/lifecycle-agent/lca-cli/ops"
 	"github.com/spf13/cobra"
@@ -40,7 +36,6 @@ var initMonitorCmd = &cobra.Command{
 var (
 	launchMonitor              bool
 	monitorSvcUnitComponentTag string
-	monitorMode                string
 )
 
 func init() {
@@ -50,7 +45,6 @@ func init() {
 
 	initMonitorCmd.Flags().BoolVar(&launchMonitor, "monitor", false, "Run LCA init monitor")
 	initMonitorCmd.Flags().StringVar(&monitorSvcUnitComponentTag, "exec-stop-post", "", "Run ExecStopPost, with specified component tag")
-	initMonitorCmd.Flags().StringVar(&monitorMode, "mode", "ibu", "Init monitor mode: 'ibu' or 'ipc'")
 	initMonitorCmd.MarkFlagsMutuallyExclusive("monitor", "exec-stop-post")
 }
 
@@ -58,29 +52,14 @@ func initMonitor() error {
 	var hostCommandsExecutor ops.Execute
 	hostCommandsExecutor = ops.NewRegularExecutor(log, true)
 
-	if data, err := os.ReadFile(common.PathOutsideChroot(common.InitMonitorModeFile)); err == nil {
-		if val := strings.TrimSpace(string(data)); val != "" {
-			monitorMode = val
-			log.Infof("init-monitor mode set from file: %s", monitorMode)
-		}
-	}
-
-	initMonitorRunner := initmonitor.NewInitMonitor(
-		scheme,
-		log,
-		hostCommandsExecutor,
-		ops.NewOps(log, hostCommandsExecutor),
-		monitorSvcUnitComponentTag,
-		monitorMode,
-	)
-	ctx := context.Background()
+	initMonitorRunner := initmonitor.NewInitMonitor(scheme, log, hostCommandsExecutor, ops.NewOps(log, hostCommandsExecutor), monitorSvcUnitComponentTag)
 	if launchMonitor {
-		if err := initMonitorRunner.RunInitMonitor(ctx); err != nil {
+		if err := initMonitorRunner.RunInitMonitor(); err != nil {
 			return fmt.Errorf("failed to run init monitor: %w", err)
 		}
 		return nil
 	} else if monitorSvcUnitComponentTag != "" {
-		if err := initMonitorRunner.RunExitStopPostCheck(ctx); err != nil {
+		if err := initMonitorRunner.RunExitStopPostCheck(); err != nil {
 			return fmt.Errorf("failed to run exit stop post check: %w", err)
 		}
 		return nil

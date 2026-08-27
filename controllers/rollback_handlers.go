@@ -18,7 +18,10 @@ package controllers
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -32,17 +35,62 @@ import (
 )
 
 func (r *ImageBasedUpgradeReconciler) getRollbackAvailabilityExpiration(ctx context.Context) (time.Time, error) {
+	expiry := time.Time{}
+
 	stateroot, err := r.RPMOstreeClient.GetUnbootedStaterootName(ctx)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("unable to determine onbooted stateroot path for rollback: %w", err)
+		return expiry, fmt.Errorf("unable to determine unbooted stateroot: %w", err)
 	}
 
-	expiry, err := common.GetRollbackAvailabilityExpiration(stateroot, r.Log)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to get rollback availability expiration for stateroot %q: %w", stateroot, err)
+	staterootPath := common.PathOutsideChroot(common.GetStaterootPath(stateroot))
+
+	certfiles := []string{
+		"/var/lib/kubelet/pki/kubelet-client-current.pem",
+		"/var/lib/kubelet/pki/kubelet-server-current.pem",
 	}
 
-	return expiry, nil
+	for _, certfile := range certfiles {
+		fname := filepath.Join(staterootPath, certfile)
+
+		// Evaluate symlinks, if needed
+		if _, err := os.Stat(fname); err != nil {
+			if _, err = os.Lstat(fname); err != nil {
+				r.Log.Error(err, "unable to read file", "filepath", fname)
+				continue
+			} else if target, err := os.Readlink(fname); err != nil {
+				r.Log.Error(err, "unable to read link", "filepath", fname)
+				continue
+			} else {
+				fname = filepath.Join(staterootPath, target)
+			}
+		}
+
+		certs, err := tls.LoadX509KeyPair(fname, fname)
+		if err != nil {
+			r.Log.Error(err, "failed to parse cert file", "certfile", certfile)
+			continue
+		}
+
+		for _, cert := range certs.Certificate {
+			// Check certificate expiry
+			parsed, err := x509.ParseCertificate(cert)
+			if err != nil {
+				r.Log.Error(err, "failed to parse cert from file", "certfile", certfile)
+				continue
+			}
+
+			if expiry.Equal(time.Time{}) || expiry.After(parsed.NotAfter) {
+				expiry = parsed.NotAfter
+			}
+		}
+	}
+
+	if expiry.Equal(time.Time{}) {
+		return expiry, fmt.Errorf("unable to determine control plane expiry for staterootPath=%s", staterootPath)
+	}
+
+	// Subtract 30 minutes from the expiry time
+	return expiry.Add(time.Minute * -30), nil
 }
 
 //nolint:unparam
@@ -126,7 +174,7 @@ func (r *ImageBasedUpgradeReconciler) finishRollback(ibu *ibuv1.ImageBasedUpgrad
 
 //nolint:unparam
 func (r *ImageBasedUpgradeReconciler) handleRollback(ctx context.Context, ibu *ibuv1.ImageBasedUpgrade) (ctrl.Result, error) {
-	origStaterootBooted, err := r.RebootClient.IsOrigStaterootBooted(ctx, ibu.Spec.SeedImageRef.Version)
+	origStaterootBooted, err := r.RebootClient.IsOrigStaterootBooted(ctx, ibu)
 	if err != nil {
 		utils.SetRollbackStatusFailed(ibu, err.Error())
 		return doNotRequeue(), nil

@@ -29,7 +29,6 @@ import (
 	"github.com/openshift-kni/lifecycle-agent/internal/clusterconfig"
 	"github.com/openshift-kni/lifecycle-agent/internal/extramanifest"
 	"github.com/openshift-kni/lifecycle-agent/internal/imagemgmt"
-	"github.com/openshift-kni/lifecycle-agent/internal/networkpolicies"
 	kbatchv1 "k8s.io/api/batch/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -47,8 +46,8 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	ipcv1 "github.com/openshift-kni/lifecycle-agent/api/ipconfig/v1"
 	seedgenv1 "github.com/openshift-kni/lifecycle-agent/api/seedgenerator/v1"
+	configv1 "github.com/openshift/api/config/v1"
 	ocpV1 "github.com/openshift/api/config/v1"
 	mcv1 "github.com/openshift/api/machineconfiguration/v1"
 	operatorv1alpha1 "github.com/openshift/api/operator/v1alpha1"
@@ -85,7 +84,6 @@ import (
 )
 
 // +kubebuilder:rbac:groups="security.openshift.io",resources=securitycontextconstraints,resourceNames=privileged,verbs=use
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs="*"
 
 var (
 	scheme   = runtime.NewScheme()
@@ -100,7 +98,6 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(ibuv1.AddToScheme(scheme))
 	utilruntime.Must(seedgenv1.AddToScheme(scheme))
-	utilruntime.Must(ipcv1.AddToScheme(scheme))
 	utilruntime.Must(ocpV1.AddToScheme(scheme))
 	utilruntime.Must(mcv1.AddToScheme(scheme))
 	utilruntime.Must(velerov1.AddToScheme(scheme))
@@ -146,7 +143,7 @@ func main() {
 		&ocpV1.Infrastructure{},
 	)
 
-	le := leaderelection.LeaderElectionSNOConfig(ocpV1.LeaderElection{})
+	le := leaderelection.LeaderElectionSNOConfig(configv1.LeaderElection{})
 
 	mux := &sync.Mutex{}
 
@@ -158,24 +155,6 @@ func main() {
 
 	cfg := ctrl.GetConfigOrDie()
 	cfg.Wrap(lcautils.RetryMiddleware(log.WithName("ibu-manager-client"))) // allow all client calls to be retriable
-
-	// OLM installs the default-deny, operator API egress NetworkPolicies
-	// Operator installs policies for the jobs, for metrics
-	np := networkpolicies.Policy{
-		Namespace:  common.LcaNamespace,
-		MetricAddr: metricsAddr,
-	}
-	msg, err := np.InstallPolicies(cfg)
-	if err != nil {
-		setupLog.Error(err, "unable to create network policy:")
-		os.Exit(1)
-	}
-	setupLog.Info(msg)
-
-	if msg := networkpolicies.Check(cfg, common.LcaNamespace); msg != "" {
-		setupLog.Info("NetworkPolicies", "msg", msg)
-	}
-
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                        scheme,
 		HealthProbeBindAddress:        probeAddr,
@@ -216,15 +195,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	chrootExecutor := ops.NewChrootExecutor(newLogger, true, common.Host)
-	chrootOp := ops.NewOps(newLogger, chrootExecutor)
-	nsenterExecutor := ops.NewNsenterExecutor(newLogger, true)
-	nsenterOp := ops.NewOps(newLogger, nsenterExecutor)
-	rpmOstreeClient := rpmostreeclient.NewClient("ibu-controller", chrootExecutor)
-	ostreeClient := ostreeclient.NewClient(chrootExecutor, false)
-	ibuRebootClient := reboot.NewIBURebootClient(&log, chrootExecutor, rpmOstreeClient, ostreeClient, chrootOp)
-	ipcRebootClient := reboot.NewIPCRebootClient(&log, chrootExecutor, rpmOstreeClient, ostreeClient, chrootOp)
-	imageMgmtClient := imagemgmt.NewImageMgmtClient(&log, chrootExecutor, common.PathOutsideChroot(common.ContainerStoragePath))
+	executor := ops.NewChrootExecutor(newLogger, true, common.Host)
+	op := ops.NewOps(newLogger, executor)
+	rpmOstreeClient := rpmostreeclient.NewClient("ibu-controller", executor)
+	ostreeClient := ostreeclient.NewClient(executor, false)
+	rebootClient := reboot.NewRebootClient(&log, executor, rpmOstreeClient, ostreeClient, op)
+	imageMgmtClient := imagemgmt.NewImageMgmtClient(&log, executor, common.PathOutsideChroot(common.ContainerStoragePath))
 
 	if err := lcautils.InitIBU(context.TODO(), mgr.GetClient(), &setupLog); err != nil {
 		setupLog.Error(err, "unable to initialize IBU CR")
@@ -233,11 +209,6 @@ func main() {
 
 	if err := initSeedGen(context.TODO(), mgr.GetClient(), &setupLog); err != nil {
 		setupLog.Error(err, "unable to initialize SeedGenerator CR")
-		os.Exit(1)
-	}
-
-	if err := lcautils.InitIPConfig(context.TODO(), mgr.GetClient(), &setupLog); err != nil {
-		setupLog.Error(err, "unable to initialize IPConfig CR")
 		os.Exit(1)
 	}
 
@@ -252,7 +223,7 @@ func main() {
 	extraManifest := &extramanifest.EMHandler{
 		Client: mgr.GetClient(), DynamicClient: dynamicClient, Log: log.WithName("ExtraManifest")}
 
-	containerStorageMountpointTarget, err := chrootOp.GetContainerStorageTarget(context.TODO())
+	containerStorageMountpointTarget, err := op.GetContainerStorageTarget(context.TODO())
 	if err != nil {
 		setupLog.Error(err, "unable to get container storage mountpoint target")
 		os.Exit(1)
@@ -281,10 +252,10 @@ func main() {
 		Scheme:          mgr.GetScheme(),
 		Precache:        &precache.PHandler{Client: mgr.GetClient(), Log: log.WithName("Precache"), Scheme: mgr.GetScheme()},
 		RPMOstreeClient: rpmOstreeClient,
-		Executor:        chrootExecutor,
+		Executor:        executor,
 		OstreeClient:    ostreeClient,
-		Ops:             chrootOp,
-		RebootClient:    ibuRebootClient,
+		Ops:             op,
+		RebootClient:    rebootClient,
 		BackupRestore:   backupRestore,
 		ExtraManifest:   extraManifest,
 		UpgradeHandler: &controllers.UpgHandler{
@@ -294,12 +265,12 @@ func main() {
 			BackupRestore:   backupRestore,
 			ExtraManifest:   extraManifest,
 			ClusterConfig:   &clusterconfig.UpgradeClusterConfigGather{Client: mgr.GetClient(), Scheme: mgr.GetScheme(), Log: log},
-			Executor:        chrootExecutor,
-			Ops:             chrootOp,
+			Executor:        executor,
+			Ops:             op,
 			Recorder:        mgr.GetEventRecorderFor("ImageBasedUpgrade"),
 			RPMOstreeClient: rpmOstreeClient,
 			OstreeClient:    ostreeClient,
-			RebootClient:    ibuRebootClient,
+			RebootClient:    rebootClient,
 		},
 		Mux:       mux,
 		Clientset: clientset,
@@ -314,53 +285,6 @@ func main() {
 	}
 	//+kubebuilder:scaffold:builder
 
-	if err = (&controllers.IPConfigReconciler{
-		Client:          mgr.GetClient(),
-		NoncachedClient: mgr.GetAPIReader(),
-		Scheme:          mgr.GetScheme(),
-		ChrootOps:       chrootOp,
-		NsenterOps:      nsenterOp,
-		RebootClient:    ipcRebootClient,
-		OstreeClient:    ostreeClient,
-		RPMOstreeClient: rpmOstreeClient,
-		Mux:             mux,
-		IdleHandler: controllers.NewIPCIdleStageHandler(
-			mgr.GetClient(),
-			mgr.GetAPIReader(),
-			chrootOp,
-			ostreeClient,
-			rpmOstreeClient,
-		),
-		ConfigHandler: controllers.NewIPCConfigStageHandler(
-			mgr.GetClient(),
-			mgr.GetAPIReader(),
-			rpmOstreeClient,
-			chrootOp,
-			controllers.NewIPCConfigTwoPhaseHandler(
-				mgr.GetClient(),
-				mgr.GetAPIReader(),
-				rpmOstreeClient,
-				ostreeClient,
-				chrootOp,
-				ipcRebootClient,
-			),
-		),
-		RollbackHandler: controllers.NewIPCRollbackStageHandler(
-			mgr.GetClient(),
-			rpmOstreeClient,
-			chrootOp,
-			controllers.NewIPCRollbackTwoPhaseHandler(
-				mgr.GetClient(),
-				mgr.GetAPIReader(),
-				rpmOstreeClient,
-				chrootOp,
-			),
-		),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "IPConfig")
-		os.Exit(1)
-	}
-
 	seedgenLog := ctrl.Log.WithName("controllers").WithName("SeedGenerator")
 	if err = (&controllers.SeedGeneratorReconciler{
 		Client:          mgr.GetClient(),
@@ -368,7 +292,7 @@ func main() {
 		Log:             seedgenLog,
 		Scheme:          mgr.GetScheme(),
 		BackupRestore:   backupRestore,
-		Executor:        chrootExecutor,
+		Executor:        executor,
 		Mux:             mux,
 
 		// Cluster data retrieved once during init
